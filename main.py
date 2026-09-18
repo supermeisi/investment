@@ -1,9 +1,88 @@
 import csv
+import sqlite3
 import urllib.request
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import itertools
+
+
+DATABASE_PATH = "ranking.db"
+
+
+def initialize_database(connection: sqlite3.Connection) -> None:
+    """Create the table used to persist each instrument as it is processed."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS portfolio (
+            isin TEXT PRIMARY KEY,
+            ticker TEXT,
+            status TEXT NOT NULL,
+            error TEXT,
+            price REAL,
+            one_year_return REAL,
+            max_drawdown REAL,
+            sharpe REAL,
+            trend_sma200 REAL,
+            score REAL
+        )
+        """
+    )
+    connection.commit()
+
+
+def save_instrument(
+    connection: sqlite3.Connection,
+    isin: str,
+    ticker: str | None = None,
+    metrics: dict | None = None,
+    status: str = "processed",
+    error: str | None = None,
+) -> None:
+    """Persist the current processing result immediately."""
+    connection.execute(
+        """
+        INSERT INTO portfolio (
+            isin, ticker, status, error, price, one_year_return,
+            max_drawdown, sharpe, trend_sma200, score
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(isin) DO UPDATE SET
+            ticker = excluded.ticker,
+            status = excluded.status,
+            error = excluded.error,
+            price = excluded.price,
+            one_year_return = excluded.one_year_return,
+            max_drawdown = excluded.max_drawdown,
+            sharpe = excluded.sharpe,
+            trend_sma200 = excluded.trend_sma200,
+            score = NULL
+        """,
+        (
+            isin,
+            ticker,
+            status,
+            error,
+            metrics.get("Price") if metrics else None,
+            metrics.get("1Y_Return_%") if metrics else None,
+            metrics.get("Max_DD_%") if metrics else None,
+            metrics.get("Sharpe") if metrics else None,
+            metrics.get("Trend_SMA200_%") if metrics else None,
+        ),
+    )
+    connection.commit()
+
+
+def save_scores(connection: sqlite3.Connection, ranked_table: pd.DataFrame) -> None:
+    """Persist the final scores after all instruments have been ranked."""
+    if ranked_table.empty:
+        return
+
+    connection.executemany(
+        "UPDATE portfolio SET score = ? WHERE isin = ?",
+        ranked_table[["Score", "ISIN"]].itertuples(index=False, name=None),
+    )
+    connection.commit()
 
 
 def get_isin_list(url: str, limit: int = 10) -> list[str]:
@@ -115,43 +194,44 @@ def rank_portfolio(records: list[dict]) -> pd.DataFrame:
     return df[columns].sort_values(by="Score", ascending=False).reset_index(drop=True)
 
 
-def save_ranking(ranked_table: pd.DataFrame, output_path: str = "ranking.csv") -> None:
-    """Save the ranked portfolio to a CSV file."""
-    ranked_table.to_csv(output_path, index=False)
-
-
 def main():
     url = "https://www.cashmarket.deutsche-boerse.com/resource/blob/1528/5d846a1a320a80f824bcd1b9db5f3067/data/t7-xetr-allTradableInstruments.csv"
     
     # Start with 15-20 to avoid rate limits while testing
-    isin_list = get_isin_list(url=url, limit=None)
+    isin_list = get_isin_list(url=url, limit=10)
     print(f"Collected {len(isin_list)} ISINs from Deutsche Börse.")
 
     collected_data = []
 
-    for isin in isin_list:
-        try:
-            ticker, df_history = get_history_by_isin(isin)
-            metrics = calculate_metrics(df_history)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        initialize_database(connection)
 
-            if metrics:
-                metrics["ISIN"] = isin
-                metrics["Ticker"] = ticker
-                collected_data.append(metrics)
-                print(f"✓ Processed {isin} ({ticker})")
-            else:
-                print(f"⚠ Skipped {isin} ({ticker}): Less than 1 year of data.")
-        except Exception as e:
-            print(f"✗ Failed {isin}: {e}")
+        for isin in isin_list:
+            try:
+                ticker, df_history = get_history_by_isin(isin)
+                metrics = calculate_metrics(df_history)
 
-    # Rank and display
-    print("\n" + "=" * 80)
-    print("BEST TO WORST INVESTMENT RANKING")
-    print("=" * 80)
-    ranked_table = rank_portfolio(collected_data)
-    print(ranked_table.to_string())
-    save_ranking(ranked_table)
-    print("\nRanking saved to ranking.csv")
+                if metrics:
+                    metrics["ISIN"] = isin
+                    metrics["Ticker"] = ticker
+                    collected_data.append(metrics)
+                    save_instrument(connection, isin, ticker, metrics)
+                    print(f"✓ Processed {isin} ({ticker})")
+                else:
+                    save_instrument(connection, isin, ticker, status="skipped")
+                    print(f"⚠ Skipped {isin} ({ticker}): Less than 1 year of data.")
+            except Exception as e:
+                save_instrument(connection, isin, status="failed", error=str(e))
+                print(f"✗ Failed {isin}: {e}")
+
+        # Rank and display
+        print("\n" + "=" * 80)
+        print("BEST TO WORST INVESTMENT RANKING")
+        print("=" * 80)
+        ranked_table = rank_portfolio(collected_data)
+        print(ranked_table.to_string())
+        save_scores(connection, ranked_table)
+        print(f"\nProcessing results saved to {DATABASE_PATH}")
 
 
 if __name__ == "__main__":
