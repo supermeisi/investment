@@ -21,8 +21,6 @@ def get_isin_list(url, limit=10):
     return isin_list
 
 
-import yfinance as yf
-
 def get_price_by_isin(ticker_symbol: str):
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -53,10 +51,44 @@ def get_price_by_isin(ticker_symbol: str):
     return price, currency
 
 
+def get_history_by_isin(isin: str, preferred_exchange: str | None = None) -> tuple[str, pd.DataFrame]:
+    search = yf.Search(isin, max_results=5)
+    
+    if not search.quotes:
+        raise ValueError(f"No ticker found on Yahoo Finance for ISIN: {isin}")
+    
+    selected_quote = None
+    if preferred_exchange:
+        for quote in search.quotes:
+            if quote.get("exchange", "").upper() == preferred_exchange.upper():
+                selected_quote = quote
+                break
+    
+    if not selected_quote:
+        selected_quote = search.quotes[0]
+        
+    ticker_symbol = selected_quote["symbol"]
+    exchange = selected_quote.get("exchange", "Unknown")
+    print(f"ISIN {isin} -> {ticker_symbol} (Exchange: {exchange})")
+    
+    ticker = yf.Ticker(ticker_symbol)
+    
+    df = ticker.history(period="5y")
+    
+    return ticker_symbol, df
+
+
 def get_prices(isin_list):
     for isin in isin_list:
         price, currency = get_price_by_isin(isin)
         print(price, currency)
+        ticker_symbol, df_history = get_history_by_isin(isin)
+        
+        print("\n--- First 5 Trading Days ---")
+        print(df_history.head())
+
+        print("\n--- Most Recent 5 Trading Days ---")
+        print(df_history.tail())
 
 
 def main():
