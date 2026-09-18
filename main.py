@@ -3,6 +3,7 @@ import urllib.request
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import itertools
 
 
 def get_isin_list(url: str, limit: int = 10) -> list[str]:
@@ -19,11 +20,9 @@ def get_isin_list(url: str, limit: int = 10) -> list[str]:
     next(reader, None)
 
     isin_list = []
-    for row in reader:
+    for row in itertools.islice(reader, limit):
         if len(row) > 3 and row[3].strip():
             isin_list.append(row[3].strip())
-        if len(isin_list) >= limit:
-            break
 
     return isin_list
 
@@ -120,7 +119,7 @@ def main():
     url = "https://www.cashmarket.deutsche-boerse.com/resource/blob/1528/5d846a1a320a80f824bcd1b9db5f3067/data/t7-xetr-allTradableInstruments.csv"
     
     # Start with 15-20 to avoid rate limits while testing
-    isin_list = get_isin_list(url=url, limit=15)
+    isin_list = get_isin_list(url=url, limit=None)
     print(f"Collected {len(isin_list)} ISINs from Deutsche Börse.")
 
     collected_data = []
