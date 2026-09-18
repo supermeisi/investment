@@ -24,22 +24,22 @@ def get_isin_list(url, limit=10):
 import yfinance as yf
 
 def get_price_by_isin(ticker_symbol: str):
-    ticker = yf.Ticker(ticker_symbol)
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+    except:
+        return None, None
     
-    # 1. Try fast_info primary and secondary fields
     price = ticker.fast_info.get("last_price")
     if price is None:
         price = ticker.fast_info.get("previous_close")
     
     currency = ticker.fast_info.get("currency")
-    
-    # 2. Fall back to 1-day history if fast_info returned None
+
     if price is None:
         hist = ticker.history(period="5d")  # 5d covers weekends and holidays
         if not hist.empty:
             price = hist["Close"].dropna().iloc[-1]
             
-    # 3. Fall back to regular .info dictionary as last resort
     if price is None:
         info = ticker.info
         price = (
