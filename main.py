@@ -115,6 +115,11 @@ def rank_portfolio(records: list[dict]) -> pd.DataFrame:
     return df[columns].sort_values(by="Score", ascending=False).reset_index(drop=True)
 
 
+def save_ranking(ranked_table: pd.DataFrame, output_path: str = "ranking.csv") -> None:
+    """Save the ranked portfolio to a CSV file."""
+    ranked_table.to_csv(output_path, index=False)
+
+
 def main():
     url = "https://www.cashmarket.deutsche-boerse.com/resource/blob/1528/5d846a1a320a80f824bcd1b9db5f3067/data/t7-xetr-allTradableInstruments.csv"
     
@@ -145,6 +150,8 @@ def main():
     print("=" * 80)
     ranked_table = rank_portfolio(collected_data)
     print(ranked_table.to_string())
+    save_ranking(ranked_table)
+    print("\nRanking saved to ranking.csv")
 
 
 if __name__ == "__main__":
