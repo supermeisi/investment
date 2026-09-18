@@ -1,4 +1,5 @@
 import csv
+import numpy as np
 import urllib.request
 import yfinance as yf
 
@@ -78,6 +79,116 @@ def get_history_by_isin(isin: str, preferred_exchange: str | None = None) -> tup
     return ticker_symbol, df
 
 
+def evaluate_investment(df: pd.DataFrame) -> dict:
+    """
+    Evaluates a 5-year OHLCV DataFrame using trend, momentum, and risk metrics.
+    """
+    close = df["Close"].dropna()
+    if len(close) < 252:
+        return {"decision": "INSUFFICIENT DATA", "details": {}}
+
+    # 1. 200-day SMA Trend
+    sma_200 = close.rolling(window=200).mean().iloc[-1]
+    current_price = close.iloc[-1]
+    above_sma = bool(current_price > sma_200)
+
+    # 2. 1-Year (252 trading days) Return
+    lookback_1y = min(252, len(close) - 1)
+    return_1y = (current_price / close.iloc[-lookback_1y] - 1) * 100
+
+    # 3. 5-Year Maximum Drawdown
+    cumulative_max = close.cummax()
+    drawdowns = (close - cumulative_max) / cumulative_max
+    max_drawdown = drawdowns.min() * 100  # negative percentage
+
+    # 4. Annualized Sharpe Ratio (assuming 3% risk-free rate)
+    daily_returns = close.pct_change().dropna()
+    rf_daily = 0.03 / 252
+    excess_returns = daily_returns - rf_daily
+    sharpe = (excess_returns.mean() / daily_returns.std()) * np.sqrt(252)
+
+    # Decision Matrix
+    passes = {
+        "Above 200 SMA": above_sma,
+        "Positive 1Y Return": return_1y > 0,
+        "Acceptable Drawdown (>-35%)": max_drawdown > -35,
+        "Healthy Sharpe (>0.5)": sharpe > 0.5,
+    }
+
+    score = sum(passes.values())
+    if score == 4:
+        verdict = "INVEST (Strong Trend & Healthy Risk Profile)"
+    elif above_sma and return_1y > 0:
+        verdict = "WATCHLIST (Uptrend intact, but elevated risk or volatility)"
+    else:
+        verdict = "AVOID (Weak trend or negative momentum)"
+
+    return {
+        "verdict": verdict,
+        "current_price": round(current_price, 2),
+        "sma_200": round(sma_200, 2),
+        "return_1y_pct": round(return_1y, 2),
+        "max_drawdown_5y_pct": round(max_drawdown, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "checks": passes,
+    }
+    
+
+def evaluate_investment(df: pd.DataFrame) -> dict:
+    """
+    Evaluates a 5-year OHLCV DataFrame using trend, momentum, and risk metrics.
+    """
+    close = df["Close"].dropna()
+    if len(close) < 252:
+        return {"decision": "INSUFFICIENT DATA", "details": {}}
+
+    # 1. 200-day SMA Trend
+    sma_200 = close.rolling(window=200).mean().iloc[-1]
+    current_price = close.iloc[-1]
+    above_sma = bool(current_price > sma_200)
+
+    # 2. 1-Year (252 trading days) Return
+    lookback_1y = min(252, len(close) - 1)
+    return_1y = (current_price / close.iloc[-lookback_1y] - 1) * 100
+
+    # 3. 5-Year Maximum Drawdown
+    cumulative_max = close.cummax()
+    drawdowns = (close - cumulative_max) / cumulative_max
+    max_drawdown = drawdowns.min() * 100  # negative percentage
+
+    # 4. Annualized Sharpe Ratio (assuming 3% risk-free rate)
+    daily_returns = close.pct_change().dropna()
+    rf_daily = 0.03 / 252
+    excess_returns = daily_returns - rf_daily
+    sharpe = (excess_returns.mean() / daily_returns.std()) * np.sqrt(252)
+
+    # Decision Matrix
+    passes = {
+        "Above 200 SMA": above_sma,
+        "Positive 1Y Return": return_1y > 0,
+        "Acceptable Drawdown (>-35%)": max_drawdown > -35,
+        "Healthy Sharpe (>0.5)": sharpe > 0.5,
+    }
+
+    score = sum(passes.values())
+    if score == 4:
+        verdict = "INVEST (Strong Trend & Healthy Risk Profile)"
+    elif above_sma and return_1y > 0:
+        verdict = "WATCHLIST (Uptrend intact, but elevated risk or volatility)"
+    else:
+        verdict = "AVOID (Weak trend or negative momentum)"
+
+    return {
+        "verdict": verdict,
+        "current_price": round(current_price, 2),
+        "sma_200": round(sma_200, 2),
+        "return_1y_pct": round(return_1y, 2),
+        "max_drawdown_5y_pct": round(max_drawdown, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "checks": passes,
+    }
+
+
 def get_prices(isin_list):
     for isin in isin_list:
         price, currency = get_price_by_isin(isin)
@@ -89,6 +200,14 @@ def get_prices(isin_list):
 
         print("\n--- Most Recent 5 Trading Days ---")
         print(df_history.tail())
+        
+        result = evaluate_investment(df_history)
+        
+        print(f"Verdict: {result['verdict']}")
+        
+        for metric, passed in result["checks"].items():
+            print(f" - {metric}: {'PASS' if passed else 'FAIL'}")
+            print(f"Metrics: 1Y Return={result['return_1y_pct']}%, Max DD={result['max_drawdown_5y_pct']}%, Sharpe={result['sharpe_ratio']}")
 
 
 def main():
