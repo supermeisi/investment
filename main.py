@@ -498,10 +498,11 @@ def walk_forward_validate(dataset: pd.DataFrame, feature_cols: list[str]) -> pd.
             continue
 
         clf, reg = _new_models()
-        clf.fit(train[feature_cols], train["target_clf"])
-        reg.fit(train[feature_cols], train["target_reg"])
-        prob = clf.predict_proba(test[feature_cols])[:, 1]
-        pred_ret = reg.predict(test[feature_cols])
+        with parallel_config(backend="threading", n_jobs=4):
+            clf.fit(train[feature_cols], train["target_clf"])
+            reg.fit(train[feature_cols], train["target_reg"])
+            prob = clf.predict_proba(test[feature_cols])[:, 1]
+            pred_ret = reg.predict(test[feature_cols])
 
         auc = roc_auc_score(test["target_clf"], prob)
         brier = brier_score_loss(test["target_clf"], prob)
@@ -567,18 +568,23 @@ def train_global_ai_models(pooled_records: list[dict]) -> tuple[CalibratedRFClas
         fit = dataset[dataset["target_end_date"] < calib_start]
         calib = dataset[dataset["sample_date"] >= calib_start]
         if len(fit) >= 1000 and len(calib) >= 100 and fit["target_clf"].nunique() == 2 and calib["target_clf"].nunique() == 2:
-            base_clf.fit(fit[feature_cols], fit["target_clf"])
-            raw_prob = base_clf.predict_proba(calib[feature_cols])[:, 1]
+            with parallel_config(backend="threading", n_jobs=4):
+                base_clf.fit(fit[feature_cols], fit["target_clf"])
+                raw_prob = base_clf.predict_proba(calib[feature_cols])[:, 1]
+
             calibrator = IsotonicRegression(out_of_bounds="clip")
             calibrator.fit(raw_prob, calib["target_clf"].to_numpy())
             print(f"✓ Wahrscheinlichkeitskalibrierung auf {len(calib):,} jüngsten, zeitlich getrennten Zeilen angepasst.")
         else:
-            base_clf.fit(dataset[feature_cols], dataset["target_clf"])
+            with parallel_config(backend="threading", n_jobs=4):
+                base_clf.fit(dataset[feature_cols], dataset["target_clf"])
     else:
-        base_clf.fit(dataset[feature_cols], dataset["target_clf"])
+        with parallel_config(backend="threading", n_jobs=4):
+            base_clf.fit(dataset[feature_cols], dataset["target_clf"])
 
     # Regression is trained on all labelled history after validation; current inference is beyond all labels.
-    reg.fit(dataset[feature_cols], dataset["target_reg"])
+    with parallel_config(backend="threading", n_jobs=4):
+        reg.fit(dataset[feature_cols], dataset["target_reg"])
     print("✓ Globales Produktionsmodell trainiert.\n")
     return CalibratedRFClassifier(base_clf, calibrator), reg, validation
 
@@ -807,8 +813,9 @@ def main():
             pred_ret = 0.0
             forecast_series = None
         else:
-            prob = float(clf_global.predict_proba(latest_feat)[0][1])
-            pred_ret = float(reg_global.predict(latest_feat)[0])
+            with parallel_config(backend="threading", n_jobs=4):
+                prob = float(clf_global.predict_proba(latest_feat)[0][1])
+                pred_ret = float(reg_global.predict(latest_feat)[0])
 
             current_price = metrics["Price"]
             last_date = df_history.index[-1]
