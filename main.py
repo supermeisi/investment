@@ -428,7 +428,7 @@ def rank_portfolio(records: list[dict], max_per_sector: int = 2) -> tuple[pd.Dat
     df["rank_ret_5y"] = df["5Y_Return_%"].rank(pct=True)
     df["rank_sharpe"] = df["Sharpe"].rank(pct=True)
     df["rank_mom"] = df["1Y_Return_%"].rank(pct=True)
-    df["rank_risk"] = df["Max_DD_%"].rank(pct=True)
+    df["rank_risk"] = df["Max_DD_%"].rank(pct=True)  # Less negative is better
     df["rank_trend"] = df["Trend_SMA200_%"].rank(pct=True)
 
     clean_yield = df.apply(
