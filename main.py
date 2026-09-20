@@ -22,6 +22,12 @@ DATABASE_PATH = "ranking.db"
 PLOTS_DIR = "plots"
 DB_LOCK = threading.Lock()
 
+# Thread-safe tracker state
+PROGRESS_LOCK = threading.Lock()
+COMPLETED_COUNT = 0
+TOTAL_ITEMS = 0
+START_TIME = 0.0
+
 
 def initialize_database(db_path: str = DATABASE_PATH) -> None:
     with sqlite3.connect(db_path) as conn:
@@ -215,11 +221,6 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def train_ai_predictor(df: pd.DataFrame) -> tuple[float, pd.Series | None, float]:
-    """Trains both a probability classifier and a forward-trajectory regressor.
-
-    Returns:
-        (ai_probability, forward_predicted_prices, expected_return_fraction)
-    """
     if len(df) < 500:
         return 0.5, None, 0.0
 
@@ -227,10 +228,8 @@ def train_ai_predictor(df: pd.DataFrame) -> tuple[float, pd.Series | None, float
     close = df["Close"].dropna()
     current_price = close.iloc[-1]
 
-    # Target: 6-month (126 trading days) forward return
     future_return = close.shift(-126) / close - 1
     
-    # Explicitly filter out NaNs and infs in target and features
     valid_mask = (
         future_return.notna() 
         & np.isfinite(future_return) 
@@ -241,11 +240,9 @@ def train_ai_predictor(df: pd.DataFrame) -> tuple[float, pd.Series | None, float
     y_reg = future_return[valid_mask]
     y_clf = (y_reg > 0.10).astype(int)
 
-    # Need adequate training samples and at least 2 classes (both 0 and 1) for the classifier
     if len(X_train) < 200 or len(y_clf.unique()) < 2:
         return 0.5, None, 0.0
 
-    # 1. Classification for AI_Prob
     clf = RandomForestClassifier(
         n_estimators=60,
         max_depth=4,
@@ -255,7 +252,6 @@ def train_ai_predictor(df: pd.DataFrame) -> tuple[float, pd.Series | None, float
     )
     clf.fit(X_train, y_clf)
 
-    # 2. Regression for path trajectory projection
     reg = RandomForestRegressor(
         n_estimators=60,
         max_depth=4,
@@ -272,11 +268,9 @@ def train_ai_predictor(df: pd.DataFrame) -> tuple[float, pd.Series | None, float
     prob = float(clf.predict_proba(latest_features)[0][1])
     pred_6m_ret = float(reg.predict(latest_features)[0])
 
-    # Construct synthetic 126-day forward business-day path
     last_date = df.index[-1]
     future_dates = pd.bdate_range(start=last_date, periods=127)[1:]
 
-    # Smooth compounding trajectory toward target price
     target_price = current_price * (1.0 + pred_6m_ret)
     daily_growth = (target_price / current_price) ** (1 / 126)
     projected_prices = [current_price * (daily_growth ** i) for i in range(1, 127)]
@@ -298,8 +292,6 @@ def plot_single_prediction(
         return
 
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Create an isolated figure instance per thread
     fig, ax = plt.subplots(figsize=(10, 5))
 
     history_slice = df_history["Close"].iloc[-380:]
@@ -327,10 +319,8 @@ def plot_single_prediction(
     fig.tight_layout()
     filename = os.path.join(output_dir, f"{ticker}_{isin}.png")
     fig.savefig(filename, dpi=180)
-    
-    # Explicitly close this specific figure to free memory
     plt.close(fig)
-    
+
 
 def sanitize_dividend_yield(raw_yield: float | None) -> float:
     if raw_yield is None or np.isnan(raw_yield) or raw_yield <= 0:
@@ -428,7 +418,7 @@ def rank_portfolio(records: list[dict], max_per_sector: int = 2) -> tuple[pd.Dat
     df["rank_ret_5y"] = df["5Y_Return_%"].rank(pct=True)
     df["rank_sharpe"] = df["Sharpe"].rank(pct=True)
     df["rank_mom"] = df["1Y_Return_%"].rank(pct=True)
-    df["rank_risk"] = df["Max_DD_%"].rank(pct=True)  # Less negative is better
+    df["rank_risk"] = df["Max_DD_%"].rank(pct=True)
     df["rank_trend"] = df["Trend_SMA200_%"].rank(pct=True)
 
     clean_yield = df.apply(
@@ -481,10 +471,46 @@ def rank_portfolio(records: list[dict], max_per_sector: int = 2) -> tuple[pd.Dat
     return full_ranking, diversified_portfolio
 
 
+def format_duration(seconds: float) -> str:
+    """Formats raw seconds into human-readable minutes and seconds."""
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m}m {s:02d}s"
+
+
+def get_progress_prefix() -> str:
+    """Generates thread-safe progress counter, percentage, and ETA string."""
+    global COMPLETED_COUNT, TOTAL_ITEMS, START_TIME
+    with PROGRESS_LOCK:
+        COMPLETED_COUNT += 1
+        done = COMPLETED_COUNT
+        total = TOTAL_ITEMS
+        elapsed = time.time() - START_TIME
+
+    pct = (done / total) * 100 if total > 0 else 0.0
+    left = total - done
+
+    if done > 0 and left > 0:
+        rate = elapsed / done
+        eta_sec = rate * left
+        eta_str = f"ETA: {format_duration(eta_sec)}"
+    elif left == 0:
+        eta_str = "Done"
+    else:
+        eta_str = "ETA: --"
+
+    return f"[{done}/{total} | {pct:4.1f}% | {left} left | {eta_str}]"
+
+
 def process_single_isin(isin: str) -> tuple[dict | None, pd.DataFrame | None, pd.Series | None, float]:
     try:
         ticker, ticker_obj, df_history = get_history_by_isin(isin)
         metrics, forecast_series, expected_ret = calculate_metrics(df_history, ticker_obj)
+
+        prog = get_progress_prefix()
 
         if metrics:
             metrics["ISIN"] = isin
@@ -497,7 +523,6 @@ def process_single_isin(isin: str) -> tuple[dict | None, pd.DataFrame | None, pd
                 metrics=metrics,
                 status="processed",
             )
-            # Generate and save chart for this stock
             plot_single_prediction(
                 isin=isin,
                 ticker=ticker,
@@ -506,21 +531,21 @@ def process_single_isin(isin: str) -> tuple[dict | None, pd.DataFrame | None, pd
                 ai_prob=metrics["AI_Prob"],
                 expected_ret=expected_ret,
             )
-            print(f"✓ {isin} ({ticker}) — Scored & Plot Saved [AI Prob: {metrics['AI_Prob']}]")
+            print(f"{prog} ✓ {isin} ({ticker}) — Scored [AI Prob: {metrics['AI_Prob']}]")
             return metrics, df_history, forecast_series, expected_ret
         else:
             save_instrument(isin=isin, ticker=ticker, status="skipped")
-            print(f"⚠ {isin} ({ticker}) — Skipped: < 1 year of data")
+            print(f"{prog} ⚠ {isin} ({ticker}) — Skipped: < 1 year of data")
             return None, None, None, 0.0
 
     except Exception as e:
+        prog = get_progress_prefix()
         save_instrument(isin=isin, status="failed", error=str(e))
-        print(f"✗ {isin} — Failed: {e}")
+        print(f"{prog} ✗ {isin} — Failed: {e}")
         return None, None, None, 0.0
 
 
 def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_predictions_grid.png"):
-    """Creates a side-by-side 2x3 grid comparison of top candidates' projected paths."""
     if not top_picks:
         return
 
@@ -553,7 +578,6 @@ def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_pre
         if idx == 0:
             ax.legend(loc="upper left", fontsize=8)
 
-    # Turn off any unused subplot frames
     for idx in range(n_plots, len(axes)):
         axes[idx].axis("off")
 
@@ -565,11 +589,19 @@ def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_pre
 
 
 def main():
+    global TOTAL_ITEMS, START_TIME, COMPLETED_COUNT
+
     url = "https://www.cashmarket.deutsche-boerse.com/resource/blob/1528/5d846a1a320a80f824bcd1b9db5f3067/data/t7-xetr-allTradableInstruments.csv"
 
     limit_count = None
     isin_list = get_isin_list(url=url, limit=limit_count)
-    print(f"Loaded {len(isin_list)} ISINs. Starting multi-threaded analysis...\n")
+
+    # Initialize tracker state
+    TOTAL_ITEMS = len(isin_list)
+    COMPLETED_COUNT = 0
+    START_TIME = time.time()
+
+    print(f"Loaded {TOTAL_ITEMS} ISINs. Starting multi-threaded analysis...\n")
 
     initialize_database()
 
@@ -577,7 +609,6 @@ def main():
     bundle_store = {}
     max_workers = 4
 
-    start_time = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = executor.map(process_single_isin, isin_list)
         for res in results:
@@ -591,8 +622,8 @@ def main():
                     "ret": expected_ret,
                 }
 
-    elapsed = round(time.time() - start_time, 1)
-    print(f"\nProcessing finished in {elapsed}s.")
+    elapsed = round(time.time() - START_TIME, 1)
+    print(f"\nProcessing finished {TOTAL_ITEMS} items in {format_duration(elapsed)}.")
 
     full_ranking, diversified = rank_portfolio(collected_data, max_per_sector=2)
 
@@ -603,7 +634,6 @@ def main():
 
     save_scores(full_ranking)
 
-    # Add scores into the bundle store for top grid generation
     top_candidates = []
     for _, row in full_ranking.head(6).iterrows():
         isin_val = row["ISIN"]
