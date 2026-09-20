@@ -1,7 +1,9 @@
 plots/
+data/
 __pycache__/
 
 *.db
 *.png
 *.parquet
 *.csv
+*.json

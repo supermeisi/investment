@@ -1,12 +1,14 @@
 import concurrent.futures
 import csv
 import itertools
+import json
 import os
 import random
 import sqlite3
 import threading
 import time
 import urllib.request
+from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")  # Thread-sicherer, fensterloser Backend
 
@@ -23,8 +25,26 @@ from joblib import parallel_config
 DATABASE_PATH = "ranking.db"
 PLOTS_DIR = "plots"
 
+# Local cache. Override with CACHE_DIR=/some/path if desired.
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "data"))
+PRICE_CACHE_DIR = CACHE_DIR / "prices"
+FEATURE_CACHE_DIR = CACHE_DIR / "features"
+FUNDAMENTAL_CACHE_DIR = CACHE_DIR / "fundamentals"
+TICKER_MAP_CACHE_DIR = CACHE_DIR / "ticker_map"
+INSTRUMENT_CACHE_FILE = CACHE_DIR / "xetra_isins.parquet"
+
+# Cache behavior:
+#   FORCE_REFRESH=1 -> redownload master data, fundamentals and full price histories.
+#   OFFLINE=1       -> use local cache only; never call Yahoo/Xetra.
+FORCE_REFRESH = os.getenv("FORCE_REFRESH", "0").lower() in {"1", "true", "yes", "on"}
+OFFLINE = os.getenv("OFFLINE", "0").lower() in {"1", "true", "yes", "on"}
+CACHE_TTL_HOURS = float(os.getenv("CACHE_TTL_HOURS", "24"))
+PRICE_OVERLAP_DAYS = int(os.getenv("PRICE_OVERLAP_DAYS", "7"))
+FEATURE_RECOMPUTE_ROWS = int(os.getenv("FEATURE_RECOMPUTE_ROWS", "450"))
+
 DB_LOCK = threading.Lock()
 PROGRESS_LOCK = threading.Lock()
+CACHE_LOCK = threading.Lock()
 
 COMPLETED_COUNT = 0
 TOTAL_ITEMS = 0
@@ -177,29 +197,156 @@ def save_scores(ranked_table: pd.DataFrame, db_path: str = DATABASE_PATH) -> Non
         conn.commit()
 
 
+def _ensure_cache_dirs() -> None:
+    for path in [CACHE_DIR, PRICE_CACHE_DIR, FEATURE_CACHE_DIR, FUNDAMENTAL_CACHE_DIR, TICKER_MAP_CACHE_DIR]:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_is_fresh(path: Path, max_age_hours: float = CACHE_TTL_HOURS) -> bool:
+    if not path.exists():
+        return False
+    age_seconds = time.time() - path.stat().st_mtime
+    return age_seconds <= max_age_hours * 3600
+
+
+def _safe_name(value: str) -> str:
+    return ''.join(ch if ch.isalnum() or ch in {'-', '_', '.'} else '_' for ch in value)
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+
+
+def _normalize_history(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out.index = pd.to_datetime(out.index, utc=True).tz_convert(None)
+    out = out[~out.index.duplicated(keep='last')].sort_index()
+    return out
+
+
 def get_isin_list(url: str, limit: int | None = None) -> list[str]:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req) as response:
-        lines = [line.decode("utf-8", errors="ignore") for line in response.readlines()]
+    _ensure_cache_dirs()
 
-    reader = csv.reader(lines, delimiter=";")
-    next(reader, None)
-    next(reader, None)
-    next(reader, None)
+    if INSTRUMENT_CACHE_FILE.exists() and (OFFLINE or (not FORCE_REFRESH and _cache_is_fresh(INSTRUMENT_CACHE_FILE))):
+        cached = pd.read_parquet(INSTRUMENT_CACHE_FILE)
+        all_isins = sorted(cached['isin'].dropna().astype(str).unique().tolist())
+        print(f"✓ Xetra-Instrumentenliste aus Cache geladen ({len(all_isins):,} ISINs).")
+    else:
+        if OFFLINE:
+            raise RuntimeError(f"OFFLINE=1, aber kein Instrumenten-Cache vorhanden: {INSTRUMENT_CACHE_FILE}")
 
-    isin_set = set()
-    for row in reader:
-        if len(row) > 3 and row[3].strip():
-            isin = row[3].strip()
-            if len(isin) == 12:
-                isin_set.add(isin)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as response:
+            lines = [line.decode("utf-8", errors="ignore") for line in response.readlines()]
 
-    all_isins = sorted(isin_set)
+        reader = csv.reader(lines, delimiter=";")
+        next(reader, None)
+        next(reader, None)
+        next(reader, None)
+
+        isin_set = set()
+        for row in reader:
+            if len(row) > 3 and row[3].strip():
+                isin = row[3].strip()
+                if len(isin) == 12:
+                    isin_set.add(isin)
+
+        all_isins = sorted(isin_set)
+        pd.DataFrame({'isin': all_isins}).to_parquet(INSTRUMENT_CACHE_FILE, index=False)
+        print(f"✓ Xetra-Instrumentenliste heruntergeladen und gecacht ({len(all_isins):,} ISINs).")
+
     if limit is not None and limit < len(all_isins):
-        # Avoid the selection bias of taking only the first rows of the exchange file.
         rng = random.Random(42)
         return sorted(rng.sample(all_isins, limit))
     return all_isins
+
+
+def _resolve_ticker_by_isin(isin: str, preferred_exchange: str | None = None) -> str:
+    _ensure_cache_dirs()
+    map_file = TICKER_MAP_CACHE_DIR / f"{_safe_name(isin)}.json"
+    cached = _read_json(map_file) if map_file.exists() else None
+
+    if cached and cached.get('ticker') and not FORCE_REFRESH:
+        return str(cached['ticker'])
+
+    if OFFLINE:
+        raise RuntimeError(f"OFFLINE=1 und kein Ticker-Mapping im Cache für {isin}")
+
+    search = yf.Search(isin, max_results=5)
+    if not search.quotes:
+        raise ValueError(f"Kein Ticker gefunden für ISIN: {isin}")
+
+    selected_quote = None
+    if preferred_exchange:
+        for quote in search.quotes:
+            if quote.get('exchange', '').upper() == preferred_exchange.upper():
+                selected_quote = quote
+                break
+    if not selected_quote:
+        selected_quote = search.quotes[0]
+
+    ticker_symbol = selected_quote['symbol']
+    _write_json_atomic(map_file, {
+        'isin': isin,
+        'ticker': ticker_symbol,
+        'exchange': selected_quote.get('exchange'),
+        'cached_at': pd.Timestamp.now("UTC").isoformat(),
+    })
+    return ticker_symbol
+
+
+def _load_or_update_price_history(ticker_symbol: str, ticker: yf.Ticker) -> pd.DataFrame:
+    _ensure_cache_dirs()
+    cache_file = PRICE_CACHE_DIR / f"{_safe_name(ticker_symbol)}.parquet"
+
+    cached = pd.DataFrame()
+    if cache_file.exists():
+        try:
+            cached = _normalize_history(pd.read_parquet(cache_file))
+        except Exception as exc:
+            print(f"⚠ Preis-Cache für {ticker_symbol} konnte nicht gelesen werden: {exc}")
+
+    if OFFLINE:
+        if cached.empty:
+            raise RuntimeError(f"OFFLINE=1, aber kein Preis-Cache für {ticker_symbol}")
+        return cached
+
+    if FORCE_REFRESH or cached.empty:
+        fresh = _normalize_history(ticker.history(period='5y'))
+        if fresh.empty:
+            if not cached.empty:
+                return cached
+            raise ValueError(f"Keine Kursdaten für {ticker_symbol}")
+        fresh.to_parquet(cache_file)
+        return fresh
+
+    # Incremental refresh. Re-download a small overlap because vendors can correct recent candles.
+    last_date = cached.index.max()
+    start_date = (last_date - pd.Timedelta(days=PRICE_OVERLAP_DAYS)).strftime('%Y-%m-%d')
+    fresh = _normalize_history(ticker.history(start=start_date))
+
+    if fresh.empty:
+        return cached
+
+    combined = pd.concat([cached, fresh])
+    combined = _normalize_history(combined)
+    # Keep roughly the same horizon as the original program.
+    cutoff = pd.Timestamp.now("UTC").tz_localize(None) - pd.DateOffset(years=5, days=30)
+    combined = combined[combined.index >= cutoff]
+    combined.to_parquet(cache_file)
+    return combined
 
 
 def get_history_by_isin(
@@ -210,38 +357,56 @@ def get_history_by_isin(
 ) -> tuple[str, yf.Ticker, pd.DataFrame]:
     for attempt in range(max_retries):
         try:
-            time.sleep(random.uniform(0.2, 0.5))
+            if not OFFLINE:
+                time.sleep(random.uniform(0.1, 0.3))
 
-            search = yf.Search(isin, max_results=5)
-            if not search.quotes:
-                raise ValueError(f"Kein Ticker gefunden für ISIN: {isin}")
-
-            selected_quote = None
-            if preferred_exchange:
-                for quote in search.quotes:
-                    if quote.get("exchange", "").upper() == preferred_exchange.upper():
-                        selected_quote = quote
-                        break
-
-            if not selected_quote:
-                selected_quote = search.quotes[0]
-
-            ticker_symbol = selected_quote["symbol"]
+            ticker_symbol = _resolve_ticker_by_isin(isin, preferred_exchange)
             ticker = yf.Ticker(ticker_symbol)
-            df = ticker.history(period="5y")
-
+            df = _load_or_update_price_history(ticker_symbol, ticker)
             return ticker_symbol, ticker, df
 
         except Exception as e:
             err = str(e).lower()
-            if "too many requests" in err or "rate limit" in err or "429" in err:
+            if not OFFLINE and ('too many requests' in err or 'rate limit' in err or '429' in err):
                 wait_time = (base_backoff ** (attempt + 1)) + random.uniform(1.0, 3.0)
                 print(f"⏳ Rate-Limit bei {isin}. Warte {wait_time:.1f}s...")
                 time.sleep(wait_time)
             else:
-                raise e
+                raise
 
     raise RuntimeError(f"Maximale Versuche für ISIN {isin} überschritten.")
+
+
+def _get_cached_fundamentals(ticker_symbol: str, ticker: yf.Ticker) -> dict:
+    _ensure_cache_dirs()
+    cache_file = FUNDAMENTAL_CACHE_DIR / f"{_safe_name(ticker_symbol)}.json"
+    cached = _read_json(cache_file) if cache_file.exists() else None
+
+    if cached and (OFFLINE or (not FORCE_REFRESH and _cache_is_fresh(cache_file))):
+        return cached
+
+    if OFFLINE:
+        return cached or {}
+
+    info = ticker.info or {}
+    try:
+        fast_info = ticker.fast_info
+        raw_yield = fast_info.get('dividend_yield')
+    except Exception:
+        raw_yield = None
+
+    payload = {
+        'dividend_yield': raw_yield if raw_yield is not None else info.get('dividendYield'),
+        'payout_ratio': info.get('payoutRatio'),
+        'pe_ratio': info.get('trailingPE') or info.get('forwardPE'),
+        'debt_to_equity': info.get('debtToEquity'),
+        'operating_cashflow': info.get('operatingCashflow'),
+        'sector': info.get('sector', 'Unknown'),
+        'industry': info.get('industry', 'Unknown'),
+        'cached_at': pd.Timestamp.now("UTC").isoformat(),
+    }
+    _write_json_atomic(cache_file, payload)
+    return payload
 
 
 def extract_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -264,6 +429,63 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
+def build_ml_frame_cached(ticker_symbol: str, df_history: pd.DataFrame) -> pd.DataFrame:
+    """Cache technical features and forward targets per ticker.
+
+    If prices are unchanged, the cached frame is reused entirely. If new prices arrived,
+    only the recent tail is recomputed; older rows are kept from cache.
+    """
+    _ensure_cache_dirs()
+    cache_file = FEATURE_CACHE_DIR / f"{_safe_name(ticker_symbol)}.parquet"
+    history = _normalize_history(df_history)
+    if history.empty:
+        return pd.DataFrame()
+
+    last_price_date = history.index.max()
+    cached = pd.DataFrame()
+    if cache_file.exists() and not FORCE_REFRESH:
+        try:
+            cached = pd.read_parquet(cache_file)
+            cached.index = pd.to_datetime(cached.index)
+            cached_last = cached.attrs.get('source_last_date')
+            # Parquet does not reliably preserve attrs across engines; fall back to a column.
+            if '_source_last_date' in cached.columns and not cached.empty:
+                cached_last = str(cached['_source_last_date'].iloc[-1])
+            if cached_last and pd.Timestamp(cached_last) == pd.Timestamp(last_price_date):
+                return cached.drop(columns=['_source_last_date'], errors='ignore')
+        except Exception:
+            cached = pd.DataFrame()
+
+    def compute_frame(hist: pd.DataFrame) -> pd.DataFrame:
+        features = extract_features(hist)
+        close = hist['Close'].dropna()
+        future_return = close.shift(-FORWARD_DAYS) / close - 1
+        future_end_date = pd.Series(close.index, index=close.index).shift(-FORWARD_DAYS)
+        out = features.copy()
+        out['future_return'] = future_return.reindex(out.index)
+        out['future_end_date'] = pd.to_datetime(future_end_date.reindex(out.index), errors='coerce')
+        return out
+
+    if cached.empty or len(history) <= FEATURE_RECOMPUTE_ROWS:
+        result = compute_frame(history)
+    else:
+        cached = cached.drop(columns=['_source_last_date'], errors='ignore')
+        recalc_pos = max(0, len(history) - FEATURE_RECOMPUTE_ROWS)
+        recalc_start = history.index[recalc_pos]
+        context_pos = max(0, recalc_pos - 260)
+        context = history.iloc[context_pos:]
+        recomputed = compute_frame(context)
+        recomputed = recomputed[recomputed.index >= recalc_start]
+        old = cached[cached.index < recalc_start]
+        result = pd.concat([old, recomputed]).sort_index()
+        result = result[~result.index.duplicated(keep='last')]
+
+    save_df = result.copy()
+    save_df['_source_last_date'] = str(last_price_date)
+    save_df.to_parquet(cache_file)
+    return result
+
+
 def sanitize_dividend_yield(raw_yield: float | None) -> float:
     if raw_yield is None or np.isnan(raw_yield) or raw_yield <= 0:
         return 0.0
@@ -276,7 +498,7 @@ def sanitize_dividend_yield(raw_yield: float | None) -> float:
     return round(normalized, 2)
 
 
-def calculate_metrics_base(df: pd.DataFrame, ticker: yf.Ticker) -> dict | None:
+def calculate_metrics_base(df: pd.DataFrame, fundamentals: dict) -> dict | None:
     """Berechnet fundamentale und technische Standardmetriken ohne lokale ML-Vorhersage."""
     if df is None or df.empty or "Close" not in df:
         return None
@@ -303,11 +525,10 @@ def calculate_metrics_base(df: pd.DataFrame, ticker: yf.Ticker) -> dict | None:
     excess_returns = daily_returns - rf_daily
     sharpe = (excess_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() > 0 else 0.0
 
-    info = ticker.info or {}
-    raw_yield = ticker.fast_info.get("dividend_yield") or info.get("dividendYield")
+    raw_yield = fundamentals.get("dividend_yield")
     div_yield = sanitize_dividend_yield(raw_yield)
 
-    payout_ratio = info.get("payoutRatio")
+    payout_ratio = fundamentals.get("payout_ratio")
     sustainable_div = True
     if payout_ratio is not None:
         if payout_ratio > 0.85 or payout_ratio < 0.0:
@@ -315,18 +536,18 @@ def calculate_metrics_base(df: pd.DataFrame, ticker: yf.Ticker) -> dict | None:
     elif div_yield > 6.0:
         sustainable_div = False
 
-    pe_ratio = info.get("trailingPE") or info.get("forwardPE")
-    debt_to_equity = info.get("debtToEquity")
+    pe_ratio = fundamentals.get("pe_ratio")
+    debt_to_equity = fundamentals.get("debt_to_equity")
     # Yahoo commonly reports this field in percentage points (e.g. 75 == 0.75x).
     # Normalize only clearly percentage-like values and leave missing values untouched.
     if debt_to_equity is not None and debt_to_equity > 20:
         debt_to_equity = debt_to_equity / 100.0
 
-    operating_cashflow = info.get("operatingCashflow")
+    operating_cashflow = fundamentals.get("operating_cashflow")
     positive_cashflow = (operating_cashflow > 0) if operating_cashflow is not None else None
 
-    sector = info.get("sector", "Unknown")
-    industry = info.get("industry", "Unknown")
+    sector = fundamentals.get("sector", "Unknown")
+    industry = fundamentals.get("industry", "Unknown")
 
     return {
         "Price": round(current_price, 2),
@@ -379,36 +600,33 @@ def get_progress_prefix() -> str:
 
 
 def process_fetch_isin(isin: str) -> dict | None:
-    """Worker Phase 1: Daten, Features und zeitlich korrekt markierte Trainingspaare."""
+    """Worker Phase 1: cached prices/fundamentals + cached technical feature frame."""
     try:
         ticker, ticker_obj, df_history = get_history_by_isin(isin)
-        metrics = calculate_metrics_base(df_history, ticker_obj)
+        fundamentals = _get_cached_fundamentals(ticker, ticker_obj)
+        metrics = calculate_metrics_base(df_history, fundamentals)
         prog = get_progress_prefix()
 
         if metrics and len(df_history) >= 252:
             metrics["ISIN"] = isin
             metrics["Ticker"] = ticker
 
-            features = extract_features(df_history)
-            close = df_history["Close"].dropna()
-
-            future_return = close.shift(-FORWARD_DAYS) / close - 1
-            future_end_date = pd.Series(close.index, index=close.index).shift(-FORWARD_DAYS)
+            ml_frame = build_ml_frame_cached(ticker, df_history)
+            feature_cols = list(extract_features(df_history).columns)
             valid_mask = (
-                future_return.notna()
-                & np.isfinite(future_return)
-                & future_end_date.notna()
-                & features.notna().all(axis=1)
+                ml_frame['future_return'].notna()
+                & np.isfinite(ml_frame['future_return'])
+                & ml_frame['future_end_date'].notna()
+                & ml_frame[feature_cols].notna().all(axis=1)
             )
 
-            X_history = features.loc[valid_mask].copy()
-            y_reg_history = future_return.loc[valid_mask].copy()
+            X_history = ml_frame.loc[valid_mask, feature_cols].copy()
+            y_reg_history = ml_frame.loc[valid_mask, 'future_return'].copy()
             y_clf_history = (y_reg_history > TARGET_RETURN_THRESHOLD).astype(int)
-            target_end_dates = pd.to_datetime(future_end_date.loc[valid_mask].values, utc=True).tz_convert(None)
+            target_end_dates = pd.to_datetime(ml_frame.loc[valid_mask, 'future_end_date'].values, utc=True).tz_convert(None)
+            latest_feature = ml_frame[feature_cols].iloc[[-1]].copy()
 
-            latest_feature = features.iloc[[-1]].copy()
-
-            print(f"{prog} ✓ {isin} ({ticker}) — Daten und Features geladen")
+            print(f"{prog} ✓ {isin} ({ticker}) — Cache aktualisiert / Daten geladen")
             return {
                 "isin": isin,
                 "ticker": ticker,
@@ -758,6 +976,10 @@ def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_pre
 
 def main():
     global TOTAL_ITEMS, START_TIME, COMPLETED_COUNT
+
+    _ensure_cache_dirs()
+    print(f"Cache-Verzeichnis: {CACHE_DIR.resolve()}")
+    print(f"Modus: FORCE_REFRESH={FORCE_REFRESH} | OFFLINE={OFFLINE} | TTL={CACHE_TTL_HOURS:g}h\n")
 
     url = "https://www.cashmarket.deutsche-boerse.com/resource/blob/1528/5d846a1a320a80f824bcd1b9db5f3067/data/t7-xetr-allTradableInstruments.csv"
 
