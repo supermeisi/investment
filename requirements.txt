@@ -3,3 +3,4 @@ pandas
 yfinance
 seaborn
 scikit-learn
+pyarrow
