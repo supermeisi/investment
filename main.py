@@ -575,7 +575,7 @@ def main():
 
     collected_data = []
     bundle_store = {}
-    max_workers = 3
+    max_workers = 4
 
     start_time = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
