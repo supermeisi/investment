@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import brier_score_loss, mean_absolute_error, roc_auc_score
 import yfinance as yf
 
 DATABASE_PATH = "ranking.db"
@@ -26,6 +28,29 @@ PROGRESS_LOCK = threading.Lock()
 COMPLETED_COUNT = 0
 TOTAL_ITEMS = 0
 START_TIME = 0.0
+
+FORWARD_DAYS = 126
+TARGET_RETURN_THRESHOLD = 0.10
+MIN_TRAIN_DATES = 252
+WALK_FORWARD_TEST_DAYS = 126
+WALK_FORWARD_FOLDS = 3
+
+
+class CalibratedRFClassifier:
+    """Random forest plus an optional monotonic probability calibrator."""
+
+    def __init__(self, model: RandomForestClassifier, calibrator: IsotonicRegression | None = None):
+        self.model = model
+        self.calibrator = calibrator
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        raw = self.model.predict_proba(X)[:, 1]
+        if self.calibrator is not None:
+            prob = self.calibrator.predict(raw)
+        else:
+            prob = raw
+        prob = np.clip(prob, 0.0, 1.0)
+        return np.column_stack([1.0 - prob, prob])
 
 
 def initialize_database(db_path: str = DATABASE_PATH) -> None:
@@ -55,6 +80,14 @@ def initialize_database(db_path: str = DATABASE_PATH) -> None:
             )
             """
         )
+        # Lightweight schema migration for databases created by older versions.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(portfolio)")}
+        for column, sql_type in {
+            "expected_return": "REAL",
+            "history_years": "REAL",
+        }.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE portfolio ADD COLUMN {column} {sql_type}")
         conn.commit()
 
 
@@ -80,9 +113,10 @@ def save_instrument(
                     isin, ticker, sector, industry, status, error, price,
                     div_yield, payout_ratio, pe_ratio, debt_to_equity,
                     positive_cashflow, one_year_return, five_year_return,
-                    max_drawdown, sharpe, trend_sma200, ai_prob, score
+                    max_drawdown, sharpe, trend_sma200, ai_prob, expected_return,
+                    history_years, score
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(isin) DO UPDATE SET
                     ticker = excluded.ticker,
                     sector = excluded.sector,
@@ -101,6 +135,8 @@ def save_instrument(
                     sharpe = excluded.sharpe,
                     trend_sma200 = excluded.trend_sma200,
                     ai_prob = excluded.ai_prob,
+                    expected_return = excluded.expected_return,
+                    history_years = excluded.history_years,
                     score = NULL
                 """,
                 (
@@ -122,6 +158,8 @@ def save_instrument(
                     metrics.get("Sharpe") if metrics else None,
                     metrics.get("Trend_SMA200_%") if metrics else None,
                     metrics.get("AI_Prob") if metrics else None,
+                    metrics.get("Expected_Return_%") if metrics else None,
+                    metrics.get("History_Years") if metrics else None,
                 ),
             )
             conn.commit()
@@ -149,13 +187,18 @@ def get_isin_list(url: str, limit: int | None = None) -> list[str]:
     next(reader, None)
 
     isin_set = set()
-    for row in itertools.islice(reader, limit):
+    for row in reader:
         if len(row) > 3 and row[3].strip():
             isin = row[3].strip()
             if len(isin) == 12:
                 isin_set.add(isin)
 
-    return sorted(list(isin_set))
+    all_isins = sorted(isin_set)
+    if limit is not None and limit < len(all_isins):
+        # Avoid the selection bias of taking only the first rows of the exchange file.
+        rng = random.Random(42)
+        return sorted(rng.sample(all_isins, limit))
+    return all_isins
 
 
 def get_history_by_isin(
@@ -245,9 +288,10 @@ def calculate_metrics_base(df: pd.DataFrame, ticker: yf.Ticker) -> dict | None:
     sma_200 = close.rolling(window=200).mean().iloc[-1]
     trend_pct = ((current_price / sma_200) - 1) * 100
 
-    lookback_1y = min(252, len(close) - 1)
-    return_1y = ((current_price / close.iloc[-lookback_1y]) - 1) * 100
-    return_5y = ((current_price / close.iloc[0]) - 1) * 100
+    return_1y = ((current_price / close.iloc[-253]) - 1) * 100 if len(close) >= 253 else np.nan
+    history_years = (close.index[-1] - close.index[0]).days / 365.25
+    # Do not label a shorter history as a five-year return.
+    return_5y = ((current_price / close.iloc[0]) - 1) * 100 if history_years >= 4.5 else np.nan
 
     cumulative_max = close.cummax()
     drawdowns = (close - cumulative_max) / cumulative_max
@@ -272,7 +316,9 @@ def calculate_metrics_base(df: pd.DataFrame, ticker: yf.Ticker) -> dict | None:
 
     pe_ratio = info.get("trailingPE") or info.get("forwardPE")
     debt_to_equity = info.get("debtToEquity")
-    if debt_to_equity is not None and debt_to_equity > 10:
+    # Yahoo commonly reports this field in percentage points (e.g. 75 == 0.75x).
+    # Normalize only clearly percentage-like values and leave missing values untouched.
+    if debt_to_equity is not None and debt_to_equity > 20:
         debt_to_equity = debt_to_equity / 100.0
 
     operating_cashflow = info.get("operatingCashflow")
@@ -291,8 +337,9 @@ def calculate_metrics_base(df: pd.DataFrame, ticker: yf.Ticker) -> dict | None:
         "PE_Ratio": round(pe_ratio, 2) if pe_ratio is not None else None,
         "Debt_To_Equity": round(debt_to_equity, 2) if debt_to_equity is not None else None,
         "Positive_CashFlow": positive_cashflow,
-        "1Y_Return_%": round(return_1y, 2),
-        "5Y_Return_%": round(return_5y, 2),
+        "1Y_Return_%": round(return_1y, 2) if np.isfinite(return_1y) else np.nan,
+        "5Y_Return_%": round(return_5y, 2) if np.isfinite(return_5y) else np.nan,
+        "History_Years": round(history_years, 2),
         "Max_DD_%": round(max_drawdown, 2),
         "Sharpe": round(sharpe, 2),
         "Trend_SMA200_%": round(trend_pct, 2),
@@ -331,7 +378,7 @@ def get_progress_prefix() -> str:
 
 
 def process_fetch_isin(isin: str) -> dict | None:
-    """Worker für Phase 1: Lädt Daten, extrahiert Features und Trainingspaare."""
+    """Worker Phase 1: Daten, Features und zeitlich korrekt markierte Trainingspaare."""
     try:
         ticker, ticker_obj, df_history = get_history_by_isin(isin)
         metrics = calculate_metrics_base(df_history, ticker_obj)
@@ -344,16 +391,21 @@ def process_fetch_isin(isin: str) -> dict | None:
             features = extract_features(df_history)
             close = df_history["Close"].dropna()
 
-            # 6-Monats-Vorwärtsrendite (126 Handelstage)
-            future_return = close.shift(-126) / close - 1
-            valid_mask = future_return.notna() & np.isfinite(future_return) & features.notna().all(axis=1)
+            future_return = close.shift(-FORWARD_DAYS) / close - 1
+            future_end_date = pd.Series(close.index, index=close.index).shift(-FORWARD_DAYS)
+            valid_mask = (
+                future_return.notna()
+                & np.isfinite(future_return)
+                & future_end_date.notna()
+                & features.notna().all(axis=1)
+            )
 
-            X_history = features[valid_mask]
-            y_reg_history = future_return[valid_mask]
-            y_clf_history = (y_reg_history > 0.10).astype(int)
+            X_history = features.loc[valid_mask].copy()
+            y_reg_history = future_return.loc[valid_mask].copy()
+            y_clf_history = (y_reg_history > TARGET_RETURN_THRESHOLD).astype(int)
+            target_end_dates = pd.to_datetime(future_end_date.loc[valid_mask].values, utc=True).tz_convert(None)
 
-            # Aktueller Feature-Vektor (letzte Zeile für Inferenz)
-            latest_feature = features.iloc[[-1]]
+            latest_feature = features.iloc[[-1]].copy()
 
             print(f"{prog} ✓ {isin} ({ticker}) — Daten und Features geladen")
             return {
@@ -364,6 +416,7 @@ def process_fetch_isin(isin: str) -> dict | None:
                 "X_train": X_history,
                 "y_clf": y_clf_history,
                 "y_reg": y_reg_history,
+                "target_end_date": pd.Series(target_end_dates, index=X_history.index),
                 "latest_feature": latest_feature,
             }
         else:
@@ -378,66 +431,153 @@ def process_fetch_isin(isin: str) -> dict | None:
         return None
 
 
-def train_global_ai_models(pooled_records: list[dict]) -> tuple[RandomForestClassifier, RandomForestRegressor]:
-    """Trainiert ein globales Ensemble über alle historischen Datenpunkte aller ISINs."""
-    print(f"\nSammle Trainingsdaten von {len(pooled_records)} Wertpapieren...")
-    
-    all_X = []
-    all_y_clf = []
-    all_y_reg = []
-    all_rows_for_db = []
-
+def _build_training_frame(pooled_records: list[dict]) -> pd.DataFrame:
+    rows = []
     for r in pooled_records:
-        if not r["X_train"].empty:
-            all_X.append(r["X_train"])
-            all_y_clf.append(r["y_clf"])
-            all_y_reg.append(r["y_reg"])
-
-            # Attach metadata for SQLite export
-            export_df = r["X_train"].copy()
-            export_df["isin"] = r["isin"]
-            export_df["ticker"] = r["ticker"]
-            export_df["target_clf"] = r["y_clf"]
-            export_df["target_reg"] = r["y_reg"]
-            all_rows_for_db.append(export_df)
-
-    if not all_X:
+        if r["X_train"].empty:
+            continue
+        part = r["X_train"].copy()
+        part["sample_date"] = pd.to_datetime(part.index, utc=True).tz_convert(None)
+        part["target_end_date"] = pd.to_datetime(r["target_end_date"].values, utc=True).tz_convert(None)
+        part["isin"] = r["isin"]
+        part["ticker"] = r["ticker"]
+        part["target_clf"] = r["y_clf"].values
+        part["target_reg"] = r["y_reg"].values
+        rows.append(part.reset_index(drop=True))
+    if not rows:
         raise ValueError("Keine gültigen Trainingsdaten für das globale Modell vorhanden.")
+    return pd.concat(rows, ignore_index=True).sort_values("sample_date").reset_index(drop=True)
 
-    X_global = pd.concat(all_X, axis=0)
-    y_clf_global = pd.concat(all_y_clf, axis=0)
-    y_reg_global = pd.concat(all_y_reg, axis=0)
 
-    # Convert Timestamp index into a plain string date column for SQLite
-    db_dataset = pd.concat(all_rows_for_db, axis=0).reset_index()
-    date_col = db_dataset.columns[0]
-    db_dataset[date_col] = db_dataset[date_col].astype(str)
+def _new_models() -> tuple[RandomForestClassifier, RandomForestRegressor]:
+    clf = RandomForestClassifier(
+        n_estimators=250,
+        max_depth=6,
+        min_samples_leaf=30,
+        class_weight="balanced_subsample",
+        random_state=42,
+        n_jobs=-1,
+    )
+    reg = RandomForestRegressor(
+        n_estimators=250,
+        max_depth=6,
+        min_samples_leaf=30,
+        random_state=42,
+        n_jobs=-1,
+    )
+    return clf, reg
+
+
+def walk_forward_validate(dataset: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    """Expanding-window validation with target-date purging (embargo by construction)."""
+    unique_dates = np.array(sorted(pd.to_datetime(dataset["sample_date"].unique())))
+    results = []
+    if len(unique_dates) < MIN_TRAIN_DATES + WALK_FORWARD_TEST_DAYS:
+        print("⚠ Zu wenige unterschiedliche Handelstage für Walk-Forward-Validierung.")
+        return pd.DataFrame()
+
+    possible_starts = []
+    last_start = len(unique_dates) - WALK_FORWARD_TEST_DAYS
+    for fold_back in range(WALK_FORWARD_FOLDS - 1, -1, -1):
+        start_idx = last_start - fold_back * WALK_FORWARD_TEST_DAYS
+        if start_idx >= MIN_TRAIN_DATES:
+            possible_starts.append(start_idx)
+
+    print("\nWalk-Forward-Validierung (Training wird anhand target_end_date vor Testbeginn bereinigt):")
+    for fold_no, start_idx in enumerate(possible_starts, 1):
+        end_idx = min(start_idx + WALK_FORWARD_TEST_DAYS, len(unique_dates))
+        test_start = pd.Timestamp(unique_dates[start_idx])
+        test_end = pd.Timestamp(unique_dates[end_idx - 1])
+
+        train = dataset[dataset["target_end_date"] < test_start]
+        test = dataset[(dataset["sample_date"] >= test_start) & (dataset["sample_date"] <= test_end)]
+        if len(train) < 1000 or len(test) < 100 or train["target_clf"].nunique() < 2 or test["target_clf"].nunique() < 2:
+            continue
+
+        clf, reg = _new_models()
+        clf.fit(train[feature_cols], train["target_clf"])
+        reg.fit(train[feature_cols], train["target_reg"])
+        prob = clf.predict_proba(test[feature_cols])[:, 1]
+        pred_ret = reg.predict(test[feature_cols])
+
+        auc = roc_auc_score(test["target_clf"], prob)
+        brier = brier_score_loss(test["target_clf"], prob)
+        mae = mean_absolute_error(test["target_reg"], pred_ret)
+        spearman = pd.Series(pred_ret).corr(pd.Series(test["target_reg"].to_numpy()), method="spearman")
+
+        # Ranking usefulness: compare the top predicted quintile with the whole test universe.
+        cutoff = np.nanquantile(pred_ret, 0.80)
+        top_mask = pred_ret >= cutoff
+        top_mean = float(test.loc[top_mask, "target_reg"].mean()) if top_mask.any() else np.nan
+        all_mean = float(test["target_reg"].mean())
+
+        results.append({
+            "fold": fold_no,
+            "test_start": test_start.date().isoformat(),
+            "test_end": test_end.date().isoformat(),
+            "train_rows": len(train),
+            "test_rows": len(test),
+            "roc_auc": auc,
+            "brier": brier,
+            "reg_mae": mae,
+            "spearman": spearman,
+            "top20_actual_return": top_mean,
+            "all_actual_return": all_mean,
+            "top20_excess": top_mean - all_mean,
+        })
+        print(
+            f"  Fold {fold_no}: {test_start.date()}–{test_end.date()} | "
+            f"AUC={auc:.3f} Brier={brier:.3f} MAE={mae:.3f} "
+            f"Spearman={spearman:.3f} Top20 excess={top_mean-all_mean:+.3f}"
+        )
+
+    result_df = pd.DataFrame(results)
+    if not result_df.empty:
+        result_df.to_csv("walk_forward_metrics.csv", index=False)
+        print("✓ Walk-Forward-Metriken in 'walk_forward_metrics.csv' gespeichert.")
+    return result_df
+
+
+def train_global_ai_models(pooled_records: list[dict]) -> tuple[CalibratedRFClassifier, RandomForestRegressor, pd.DataFrame]:
+    """Validiert chronologisch und trainiert anschließend Produktionsmodelle mit zeitgerechter Kalibrierung."""
+    print(f"\nSammle Trainingsdaten von {len(pooled_records)} Wertpapieren...")
+    dataset = _build_training_frame(pooled_records)
+    feature_cols = [c for c in extract_features(pooled_records[0]["history"]).columns if c in dataset.columns]
 
     with sqlite3.connect(DATABASE_PATH) as conn:
+        db_dataset = dataset.copy()
+        db_dataset["sample_date"] = db_dataset["sample_date"].astype(str)
+        db_dataset["target_end_date"] = db_dataset["target_end_date"].astype(str)
         db_dataset.to_sql("training_data", conn, if_exists="replace", index=False)
-    print(f"✓ {len(db_dataset):,} Trainingszeilen in Tabelle 'training_data' in '{DATABASE_PATH}' gespeichert.")
+    print(f"✓ {len(dataset):,} Trainingszeilen in Tabelle 'training_data' in '{DATABASE_PATH}' gespeichert.")
 
-    print("Trainiere globales Klassifikations- und Regressionsmodell...")
-    clf = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=6,
-        min_samples_leaf=30,
-        random_state=42,
-        n_jobs=-1,
-    )
-    clf.fit(X_global, y_clf_global)
+    validation = walk_forward_validate(dataset, feature_cols)
 
-    reg = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=6,
-        min_samples_leaf=30,
-        random_state=42,
-        n_jobs=-1,
-    )
-    reg.fit(X_global, y_reg_global)
+    # Time-aware calibration: reserve the most recent ~126 feature dates for calibration,
+    # while purging any fitting labels that extend into that calibration period.
+    unique_dates = np.array(sorted(pd.to_datetime(dataset["sample_date"].unique())))
+    calibrator = None
+    base_clf, reg = _new_models()
 
-    print("✓ Globales Training erfolgreich abgeschlossen.\n")
-    return clf, reg
+    if len(unique_dates) > MIN_TRAIN_DATES + WALK_FORWARD_TEST_DAYS:
+        calib_start = pd.Timestamp(unique_dates[-WALK_FORWARD_TEST_DAYS])
+        fit = dataset[dataset["target_end_date"] < calib_start]
+        calib = dataset[dataset["sample_date"] >= calib_start]
+        if len(fit) >= 1000 and len(calib) >= 100 and fit["target_clf"].nunique() == 2 and calib["target_clf"].nunique() == 2:
+            base_clf.fit(fit[feature_cols], fit["target_clf"])
+            raw_prob = base_clf.predict_proba(calib[feature_cols])[:, 1]
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(raw_prob, calib["target_clf"].to_numpy())
+            print(f"✓ Wahrscheinlichkeitskalibrierung auf {len(calib):,} jüngsten, zeitlich getrennten Zeilen angepasst.")
+        else:
+            base_clf.fit(dataset[feature_cols], dataset["target_clf"])
+    else:
+        base_clf.fit(dataset[feature_cols], dataset["target_clf"])
+
+    # Regression is trained on all labelled history after validation; current inference is beyond all labels.
+    reg.fit(dataset[feature_cols], dataset["target_reg"])
+    print("✓ Globales Produktionsmodell trainiert.\n")
+    return CalibratedRFClassifier(base_clf, calibrator), reg, validation
 
 
 def plot_single_prediction(
@@ -449,6 +589,7 @@ def plot_single_prediction(
     expected_ret: float,
     output_dir: str = PLOTS_DIR,
 ) -> None:
+    """Plot history plus a dashed endpoint scenario, not a claimed daily price forecast."""
     if forecast_series is None or df_history.empty:
         return
 
@@ -456,21 +597,22 @@ def plot_single_prediction(
     fig, ax = plt.subplots(figsize=(10, 5))
 
     history_slice = df_history["Close"].iloc[-380:]
-    ax.plot(history_slice.index, history_slice.values, label="Historischer Kurs", color="#1f77b4", lw=2)
+    ax.plot(history_slice.index, history_slice.values, label="Historischer Kurs", lw=2)
 
-    bridge_dates = [history_slice.index[-1], forecast_series.index[0]]
-    bridge_prices = [history_slice.values[-1], forecast_series.values[0]]
-    ax.plot(bridge_dates, bridge_prices, color="#ff7f0e", linestyle="--", lw=2)
-
-    ax.plot(forecast_series.index, forecast_series.values, label=f"Globaler AI-Pfad (+{expected_ret*100:.1f}%)", color="#ff7f0e", lw=2)
-
-    rolling_vol = float(df_history["Close"].pct_change().std() * np.sqrt(252))
-    upper_band = forecast_series * (1 + rolling_vol * np.sqrt(np.linspace(0.05, 0.5, len(forecast_series))))
-    lower_band = forecast_series * (1 - rolling_vol * np.sqrt(np.linspace(0.05, 0.5, len(forecast_series))))
-    ax.fill_between(forecast_series.index, lower_band, upper_band, color="#ff7f0e", alpha=0.18, label="Unsicherheitsbereich")
-
-    ax.axvline(x=history_slice.index[-1], color="gray", linestyle=":", label="Prognosebeginn")
-    ax.set_title(f"{ticker} ({isin}) — 6-Monats-Prognose (Globale Wahrscheinlichkeit: {ai_prob*100:.1f}%)", fontsize=12, fontweight="bold")
+    ax.plot(
+        [history_slice.index[-1], forecast_series.index[-1]],
+        [history_slice.values[-1], forecast_series.values[-1]],
+        linestyle="--",
+        lw=2,
+        label=f"6M-Endpunktszenario ({expected_ret*100:+.1f}%)",
+    )
+    ax.scatter([forecast_series.index[-1]], [forecast_series.values[-1]], s=45, zorder=4)
+    ax.axvline(x=history_slice.index[-1], linestyle=":", label="Prognosebeginn")
+    ax.set_title(
+        f"{ticker} ({isin}) — 6M-Endpunkt | P(Return > {TARGET_RETURN_THRESHOLD*100:.0f}%)={ai_prob*100:.1f}%",
+        fontsize=12,
+        fontweight="bold",
+    )
     ax.set_xlabel("Datum")
     ax.set_ylabel("Kurs")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
@@ -488,17 +630,21 @@ def rank_portfolio(records: list[dict], max_per_sector: int = 2) -> tuple[pd.Dat
     if df.empty:
         return df, df
 
-    df["rank_ret_5y"] = df["5Y_Return_%"].rank(pct=True)
-    df["rank_sharpe"] = df["Sharpe"].rank(pct=True)
-    df["rank_mom"] = df["1Y_Return_%"].rank(pct=True)
-    df["rank_risk"] = df["Max_DD_%"].rank(pct=True)
-    df["rank_trend"] = df["Trend_SMA200_%"].rank(pct=True)
+    # Missing historical/fundamental values receive a neutral percentile rather than
+    # being silently treated as excellent or terrible.
+    def pct_rank(series: pd.Series, neutral: float = 0.5) -> pd.Series:
+        ranked = series.rank(pct=True)
+        return ranked.fillna(neutral)
+
+    df["rank_ret_5y"] = pct_rank(df["5Y_Return_%"])
+    df["rank_sharpe"] = pct_rank(df["Sharpe"])
+    df["rank_risk"] = pct_rank(df["Max_DD_%"])  # less-negative drawdown ranks higher
 
     clean_yield = df.apply(lambda r: r["Div_Yield_%"] if r["Sustainable_Div"] else 0.0, axis=1)
-    df["rank_dividend"] = clean_yield.rank(pct=True)
+    df["rank_dividend"] = pct_rank(clean_yield)
 
     def pe_score(pe):
-        if pe is None or pe <= 0:
+        if pe is None or pd.isna(pe) or pe <= 0:
             return 0.2
         if 5 <= pe <= 20:
             return 1.0
@@ -508,25 +654,34 @@ def rank_portfolio(records: list[dict], max_per_sector: int = 2) -> tuple[pd.Dat
 
     df["val_score"] = df["PE_Ratio"].apply(pe_score)
 
-    base_score = (
-        df["rank_ret_5y"] * 0.20 +
-        df["rank_sharpe"] * 0.20 +
-        df["val_score"] * 0.15 +
-        df["rank_dividend"] * 0.15 +
-        df["rank_risk"] * 0.10 +
-        df["rank_mom"] * 0.10 +
-        df["rank_trend"] * 0.10
+    # Reduce double-counting of momentum/trend. The traditional factor block focuses
+    # on long-run return, risk, valuation and dividend quality; ML already consumes momentum.
+    factor_score = (
+        df["rank_ret_5y"] * 0.25
+        + df["rank_sharpe"] * 0.25
+        + df["val_score"] * 0.20
+        + df["rank_dividend"] * 0.15
+        + df["rank_risk"] * 0.15
     ) * 100
 
-    df["Score"] = (base_score * 0.65) + ((df["AI_Prob"] * 100) * 0.35)
+    # ML block combines calibrated probability, expected return rank and downside-aware risk.
+    df["rank_expected_return"] = pct_rank(df["Expected_Return_%"])
+    df["rank_ml_risk"] = pct_rank(df["Max_DD_%"])
+    ml_score = (
+        (df["AI_Prob"].clip(0, 1) * 0.50)
+        + (df["rank_expected_return"] * 0.35)
+        + (df["rank_ml_risk"] * 0.15)
+    ) * 100
 
-    df.loc[df["Debt_To_Equity"] > 2.0, "Score"] *= 0.85
+    df["Score"] = factor_score * 0.60 + ml_score * 0.40
+
+    df.loc[df["Debt_To_Equity"].fillna(0) > 2.0, "Score"] *= 0.85
     df.loc[df["Positive_CashFlow"] == False, "Score"] *= 0.85
     df["Score"] = df["Score"].round(1)
 
     display_cols = [
-        "ISIN", "Ticker", "Sector", "Score", "AI_Prob", "Price",
-        "PE_Ratio", "Div_Yield_%", "Payout_Ratio", "5Y_Return_%", "Sharpe", "Max_DD_%"
+        "ISIN", "Ticker", "Sector", "Score", "AI_Prob", "Expected_Return_%", "Price",
+        "PE_Ratio", "Div_Yield_%", "Payout_Ratio", "5Y_Return_%", "History_Years", "Sharpe", "Max_DD_%"
     ]
     full_ranking = df[display_cols].sort_values(by="Score", ascending=False).reset_index(drop=True)
 
@@ -558,16 +713,25 @@ def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_pre
         ticker = item["metrics"]["Ticker"]
         isin = item["metrics"]["ISIN"]
         prob = item["metrics"]["AI_Prob"]
+        expected = item["metrics"]["Expected_Return_%"]
 
-        ax.plot(hist.index, hist.values, color="#1f77b4", label="Historie")
+        ax.plot(hist.index, hist.values, label="Historie")
         if f_series is not None:
-            bridge_dates = [hist.index[-1], f_series.index[0]]
-            bridge_vals = [hist.values[-1], f_series.values[0]]
-            ax.plot(bridge_dates, bridge_vals, color="#ff7f0e", linestyle="--")
-            ax.plot(f_series.index, f_series.values, color="#ff7f0e", label="6M AI Prognose")
-            ax.axvline(x=hist.index[-1], color="gray", linestyle=":")
+            ax.plot(
+                [hist.index[-1], f_series.index[-1]],
+                [hist.values[-1], f_series.values[-1]],
+                linestyle="--",
+                label="6M-Endpunkt",
+            )
+            ax.scatter([f_series.index[-1]], [f_series.values[-1]], s=30)
+            ax.axvline(x=hist.index[-1], linestyle=":")
 
-        ax.set_title(f"#{idx+1}: {ticker} ({isin}) | Score: {item['metrics']['Score']} | Prob: {prob*100:.0f}%", fontsize=10, fontweight="bold")
+        ax.set_title(
+            f"#{idx+1}: {ticker} | Score {item['metrics']['Score']} | "
+            f"P>{TARGET_RETURN_THRESHOLD*100:.0f}% {prob*100:.0f}% | E[R] {expected:+.1f}%",
+            fontsize=9,
+            fontweight="bold",
+        )
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
         ax.grid(True, linestyle="--", alpha=0.5)
         if idx == 0:
@@ -576,7 +740,7 @@ def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_pre
     for idx in range(n_plots, len(axes)):
         axes[idx].axis("off")
 
-    plt.suptitle("Top-Kandidaten: 6-Monats-Vorhersagen (Global trainiertes AI-Modell)", fontsize=14, fontweight="bold", y=0.98)
+    plt.suptitle("Top-Kandidaten: 6-Monats-Endpunktszenarien", fontsize=14, fontweight="bold", y=0.98)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output_file, dpi=200)
     plt.close()
@@ -588,8 +752,10 @@ def main():
 
     url = "https://www.cashmarket.deutsche-boerse.com/resource/blob/1528/5d846a1a320a80f824bcd1b9db5f3067/data/t7-xetr-allTradableInstruments.csv"
 
-    # None für vollständigen Durchlauf, oder z. B. 40 für Tests
-    limit_count = 100
+    # Set MAX_INSTRUMENTS=0 for the complete Xetra universe.
+    # A fixed random sample is used when a limit is set, rather than the first rows in the file.
+    env_limit = int(os.getenv("MAX_INSTRUMENTS", "100"))
+    limit_count = None if env_limit <= 0 else env_limit
     isin_list = get_isin_list(url=url, limit=limit_count)
 
     TOTAL_ITEMS = len(isin_list)
@@ -616,7 +782,11 @@ def main():
         return
 
     # Phase 2: Globales Training über alle ISIN-Daten
-    clf_global, reg_global = train_global_ai_models(fetched_records)
+    clf_global, reg_global, validation_metrics = train_global_ai_models(fetched_records)
+    if not validation_metrics.empty:
+        numeric_cols = ["roc_auc", "brier", "reg_mae", "spearman", "top20_excess"]
+        print("\nDurchschnittliche Out-of-Sample-Metriken:")
+        print(validation_metrics[numeric_cols].mean(numeric_only=True).round(3).to_string())
 
     print("Phase 3: Führe Inferenz für jedes Wertpapier mit dem globalen Modell aus...")
     collected_metrics = []
@@ -639,13 +809,13 @@ def main():
 
             current_price = metrics["Price"]
             last_date = df_history.index[-1]
-            future_dates = pd.bdate_range(start=last_date, periods=127)[1:]
+            endpoint_date = pd.bdate_range(start=last_date, periods=FORWARD_DAYS + 1)[-1]
             target_price = current_price * (1.0 + pred_ret)
-            daily_growth = (target_price / current_price) ** (1 / 126) if current_price > 0 else 1.0
-            projected_prices = [current_price * (daily_growth ** i) for i in range(1, 127)]
-            forecast_series = pd.Series(projected_prices, index=future_dates)
+            # One endpoint only: the model predicts a 126-day return, not the daily path.
+            forecast_series = pd.Series([target_price], index=[endpoint_date])
 
         metrics["AI_Prob"] = round(prob, 3)
+        metrics["Expected_Return_%"] = round(pred_ret * 100, 2)
         collected_metrics.append(metrics)
 
         save_instrument(
@@ -677,7 +847,7 @@ def main():
     full_ranking, diversified = rank_portfolio(collected_metrics, max_per_sector=2)
 
     print("\n" + "=" * 115)
-    print("FINALE INVESTMENT-RANGLISTE (MIT GLOBAL TRAINIERTEM AI-MODELL)")
+    print("FINALE INVESTMENT-RANGLISTE (OUT-OF-SAMPLE VALIDIERTER ML-ANSATZ)")
     print("=" * 115)
     print(full_ranking.to_string())
 

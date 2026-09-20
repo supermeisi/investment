@@ -1,4 +1,7 @@
 plots/
+__pycache__/
 
 *.db
 *.png
+*.parquet
+*.csv
