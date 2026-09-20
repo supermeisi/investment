@@ -18,6 +18,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss, mean_absolute_error, roc_auc_score
 import yfinance as yf
+from joblib import parallel_config
 
 DATABASE_PATH = "ranking.db"
 PLOTS_DIR = "plots"
@@ -449,22 +450,24 @@ def _build_training_frame(pooled_records: list[dict]) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True).sort_values("sample_date").reset_index(drop=True)
 
 
-def _new_models() -> tuple[RandomForestClassifier, RandomForestRegressor]:
+def _new_models():
     clf = RandomForestClassifier(
         n_estimators=250,
         max_depth=6,
         min_samples_leaf=30,
         class_weight="balanced_subsample",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=4,
     )
+
     reg = RandomForestRegressor(
         n_estimators=250,
         max_depth=6,
         min_samples_leaf=30,
         random_state=42,
-        n_jobs=-1,
+        n_jobs=4,
     )
+
     return clf, reg
 
 
@@ -766,7 +769,7 @@ def main():
     initialize_database()
 
     fetched_records = []
-    max_workers = 3
+    max_workers = 2
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = executor.map(process_fetch_isin, isin_list)
