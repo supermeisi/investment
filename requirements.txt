@@ -4,3 +4,4 @@ yfinance
 seaborn
 scikit-learn
 pyarrow
+joblib

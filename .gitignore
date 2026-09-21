@@ -1,9 +1,11 @@
 plots/
 data/
 __pycache__/
+.venv/
 
 *.db
 *.png
 *.parquet
 *.csv
 *.json
+*.joblib
