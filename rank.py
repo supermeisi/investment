@@ -1,4 +1,4 @@
-"""Generate a ranking from local cache and the saved model only. No downloads occur.
+"""Generate a ranking and direct 1–6M forecast series from local cache and the saved model only. No downloads occur.
 
 Examples:
     python rank.py
@@ -28,13 +28,13 @@ def main() -> None:
     if not isins:
         raise SystemExit("Kein verwendbarer lokaler Cache vorhanden. Zuerst 'python update_data.py' ausführen.")
 
-    classifier, regressor, feature_cols, metadata = load_production_models()
+    classifier, horizon_regressors, feature_cols, metadata = load_production_models()
     print(f"✓ Modell geladen (trainiert: {metadata.get('trained_at', 'unbekannt')}).")
 
     records = collect_records(isins, max_workers=int(os.getenv("ANALYSIS_WORKERS", "4")), phase_name="Lokale Ranking-Daten")
     if not records:
         raise SystemExit("Keine gültigen gecachten Instrumente für das Ranking.")
-    generate_ranking(records, classifier, regressor, feature_cols, create_plots=create_plots)
+    generate_ranking(records, classifier, horizon_regressors, feature_cols, create_plots=create_plots)
 
 
 if __name__ == "__main__":

@@ -115,3 +115,35 @@ RF_N_JOBS=4 python rank.py
 
 Use `RF_N_JOBS=-1` only if you explicitly want scikit-learn to use all available CPUs.
 The code no longer uses `joblib.parallel_config(...)`; each Random Forest controls its own worker count.
+
+## Direct 1–6 month price forecast
+
+The production training now fits **six independent Random Forest regressors**:
+
+- 21 trading days (`1M`)
+- 42 trading days (`2M`)
+- 63 trading days (`3M`)
+- 84 trading days (`4M`)
+- 105 trading days (`5M`)
+- 126 trading days (`6M`)
+
+These are direct horizon forecasts, not recursively generated daily prices. The chart connects the six predicted price points only as a visual guide.
+
+After upgrading from an older project/model bundle, train once again:
+
+```bash
+python train.py
+python rank.py
+```
+
+You do **not** need to redownload historical prices. Existing feature caches are upgraded locally from the cached price histories when the new target columns are missing.
+
+`rank.py` writes the numeric forecast points to:
+
+```text
+forecast_timeseries.csv
+```
+
+The file includes ISIN, ticker, horizon, approximate forecast date, current price, predicted return and predicted price.
+
+The existing ranking still uses the 126-trading-day (`6M`) expected return and the calibrated probability of exceeding the configured 6M return threshold. The shorter horizons are additional direct forecasts for the time-series view.
