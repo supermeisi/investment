@@ -1,4 +1,4 @@
-"""Train and save the 6M classifier plus direct 1–6M regressors from local cache only. No downloads occur.
+"""Train and save production models using local cache only. No downloads occur.
 
 Examples:
     python train.py

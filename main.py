@@ -48,12 +48,12 @@ def main() -> None:
         print(validation[numeric_cols].mean(numeric_only=True).round(3).to_string())
 
     print("\n=== 3/4 Produktionsmodell trainieren ===")
-    classifier, horizon_regressors = train_production_models_from_dataset(dataset, feature_cols)
-    save_production_models(classifier, horizon_regressors, feature_cols)
+    classifier, regressor = train_production_models_from_dataset(dataset, feature_cols)
+    save_production_models(classifier, regressor, feature_cols)
 
     print("\n=== 4/4 Ranking ===")
     create_plots = os.getenv("NO_PLOTS", "0").lower() not in {"1", "true", "yes", "on"}
-    generate_ranking(records, classifier, horizon_regressors, feature_cols, create_plots=create_plots)
+    generate_ranking(records, classifier, regressor, feature_cols, create_plots=create_plots)
     print_cache_summary()
 
 

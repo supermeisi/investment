@@ -116,34 +116,25 @@ RF_N_JOBS=4 python rank.py
 Use `RF_N_JOBS=-1` only if you explicitly want scikit-learn to use all available CPUs.
 The code no longer uses `joblib.parallel_config(...)`; each Random Forest controls its own worker count.
 
-## Direct 1–6 month price forecast
+## Training progress bar
 
-The production training now fits **six independent Random Forest regressors**:
-
-- 21 trading days (`1M`)
-- 42 trading days (`2M`)
-- 63 trading days (`3M`)
-- 84 trading days (`4M`)
-- 105 trading days (`5M`)
-- 126 trading days (`6M`)
-
-These are direct horizon forecasts, not recursively generated daily prices. The chart connects the six predicted price points only as a visual guide.
-
-After upgrading from an older project/model bundle, train once again:
-
-```bash
-python train.py
-python rank.py
-```
-
-You do **not** need to redownload historical prices. Existing feature caches are upgraded locally from the cached price histories when the new target columns are missing.
-
-`rank.py` writes the numeric forecast points to:
+Random Forest training now shows tree-level progress, elapsed time and an ETA. Example:
 
 ```text
-forecast_timeseries.csv
+Production classifier        [████████████░░░░░░░░░░░░░░░░░░] 100/250 ( 40.0%) | 2m 14s | ETA 3m 21s
 ```
 
-The file includes ISIN, ticker, horizon, approximate forecast date, current price, predicted return and predicted price.
+The default update interval is 10 trees. You can make the bar update more or less often:
 
-The existing ranking still uses the 126-trading-day (`6M`) expected return and the calibrated probability of exceeding the configured 6M return threshold. The shorter horizons are additional direct forecasts for the time-series view.
+```bash
+RF_PROGRESS_BATCH=5 python train.py
+RF_PROGRESS_BATCH=25 python train.py
+```
+
+Disable the progress bar and use the original one-shot `.fit()` behavior:
+
+```bash
+RF_PROGRESS=0 python train.py
+```
+
+The same progress reporting is also used for Random Forest fits during `python analyze.py` walk-forward validation.

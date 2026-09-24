@@ -54,11 +54,6 @@ TOTAL_ITEMS = 0
 START_TIME = 0.0
 
 FORWARD_DAYS = 126
-# Direct regression horizons used for the forecast time series. 21 trading days
-# is treated as roughly one month. The existing 126-day model remains the
-# ranking/expected-return target so ranking behavior stays comparable.
-FORECAST_HORIZONS = (21, 42, 63, 84, 105, 126)
-FORECAST_LABELS = {21: "1M", 42: "2M", 63: "3M", 84: "4M", 105: "5M", 126: "6M"}
 TARGET_RETURN_THRESHOLD = 0.10
 MIN_TRAIN_DATES = 252
 WALK_FORWARD_TEST_DAYS = 126
@@ -71,6 +66,14 @@ WALK_FORWARD_FOLDS = 3
 RF_N_JOBS = int(os.getenv("RF_N_JOBS", "1"))
 if RF_N_JOBS == 0 or RF_N_JOBS < -1:
     raise ValueError("RF_N_JOBS must be -1 or a positive integer.")
+
+# Training progress. Random forests are built in small warm-start batches so the
+# terminal can show real tree-level progress instead of appearing frozen during
+# a long .fit() call. Set RF_PROGRESS=0 to disable the progress bar or change
+# RF_PROGRESS_BATCH to control how many trees are added per update.
+RF_PROGRESS = os.getenv("RF_PROGRESS", "1").lower() not in {"0", "false", "no", "off"}
+RF_PROGRESS_BATCH = max(1, int(os.getenv("RF_PROGRESS_BATCH", "10")))
+RF_PROGRESS_WIDTH = max(10, int(os.getenv("RF_PROGRESS_WIDTH", "30")))
 
 # This exact warning can be emitted internally by scikit-learn on some
 # Python 3.14 builds. Our code does not call sklearn.utils.parallel.delayed
@@ -457,16 +460,10 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_ml_frame_cached(ticker_symbol: str, df_history: pd.DataFrame) -> pd.DataFrame:
-    """Cache technical features and direct forward-return targets per ticker.
+    """Cache technical features and forward targets per ticker.
 
-    The frame contains one direct regression target for every horizon in
-    ``FORECAST_HORIZONS`` plus the legacy ``future_return`` / ``future_end_date``
-    aliases for the 126-trading-day ranking target.
-
-    If prices are unchanged and the cache already contains the multi-horizon
-    columns, it is reused entirely. If the cache is old or comes from the older
-    single-horizon version, the recent feature frame is rebuilt locally from the
-    cached price history; no network access is required for that rebuild.
+    If prices are unchanged, the cached frame is reused entirely. If new prices arrived,
+    only the recent tail is recomputed; older rows are kept from cache.
     """
     _ensure_cache_dirs()
     cache_file = FEATURE_CACHE_DIR / f"{_safe_name(ticker_symbol)}.parquet"
@@ -476,59 +473,33 @@ def build_ml_frame_cached(ticker_symbol: str, df_history: pd.DataFrame) -> pd.Da
 
     last_price_date = history.index.max()
     cached = pd.DataFrame()
-    required_target_columns = {
-        *(f"future_return_{h}" for h in FORECAST_HORIZONS),
-        *(f"future_end_date_{h}" for h in FORECAST_HORIZONS),
-        "future_return",
-        "future_end_date",
-    }
-
     if cache_file.exists() and not FORCE_REFRESH:
         try:
             cached = pd.read_parquet(cache_file)
             cached.index = pd.to_datetime(cached.index)
-            cached_last = cached.attrs.get("source_last_date")
+            cached_last = cached.attrs.get('source_last_date')
             # Parquet does not reliably preserve attrs across engines; fall back to a column.
-            if "_source_last_date" in cached.columns and not cached.empty:
-                cached_last = str(cached["_source_last_date"].iloc[-1])
-            cache_has_multihorizon_targets = required_target_columns.issubset(cached.columns)
-            if (
-                cached_last
-                and pd.Timestamp(cached_last) == pd.Timestamp(last_price_date)
-                and cache_has_multihorizon_targets
-            ):
-                return cached.drop(columns=["_source_last_date"], errors="ignore")
+            if '_source_last_date' in cached.columns and not cached.empty:
+                cached_last = str(cached['_source_last_date'].iloc[-1])
+            if cached_last and pd.Timestamp(cached_last) == pd.Timestamp(last_price_date):
+                return cached.drop(columns=['_source_last_date'], errors='ignore')
         except Exception:
             cached = pd.DataFrame()
 
     def compute_frame(hist: pd.DataFrame) -> pd.DataFrame:
         features = extract_features(hist)
-        close = hist["Close"].dropna()
+        close = hist['Close'].dropna()
+        future_return = close.shift(-FORWARD_DAYS) / close - 1
+        future_end_date = pd.Series(close.index, index=close.index).shift(-FORWARD_DAYS)
         out = features.copy()
-
-        date_series = pd.Series(close.index, index=close.index)
-        for horizon in FORECAST_HORIZONS:
-            future_return = close.shift(-horizon) / close - 1
-            future_end_date = date_series.shift(-horizon)
-            out[f"future_return_{horizon}"] = future_return.reindex(out.index)
-            out[f"future_end_date_{horizon}"] = pd.to_datetime(
-                future_end_date.reindex(out.index), errors="coerce"
-            )
-
-        # Backward-compatible aliases used by the 6M classifier/ranking validation.
-        out["future_return"] = out[f"future_return_{FORWARD_DAYS}"]
-        out["future_end_date"] = out[f"future_end_date_{FORWARD_DAYS}"]
+        out['future_return'] = future_return.reindex(out.index)
+        out['future_end_date'] = pd.to_datetime(future_end_date.reindex(out.index), errors='coerce')
         return out
 
-    # If the old cache does not contain all new target columns, rebuild the whole
-    # feature file once. This is local computation from the cached price history.
-    cached_has_required = (
-        not cached.empty and required_target_columns.issubset(cached.columns)
-    )
-    if not cached_has_required or len(history) <= FEATURE_RECOMPUTE_ROWS:
+    if cached.empty or len(history) <= FEATURE_RECOMPUTE_ROWS:
         result = compute_frame(history)
     else:
-        cached = cached.drop(columns=["_source_last_date"], errors="ignore")
+        cached = cached.drop(columns=['_source_last_date'], errors='ignore')
         recalc_pos = max(0, len(history) - FEATURE_RECOMPUTE_ROWS)
         recalc_start = history.index[recalc_pos]
         context_pos = max(0, recalc_pos - 260)
@@ -537,12 +508,13 @@ def build_ml_frame_cached(ticker_symbol: str, df_history: pd.DataFrame) -> pd.Da
         recomputed = recomputed[recomputed.index >= recalc_start]
         old = cached[cached.index < recalc_start]
         result = pd.concat([old, recomputed]).sort_index()
-        result = result[~result.index.duplicated(keep="last")]
+        result = result[~result.index.duplicated(keep='last')]
 
     save_df = result.copy()
-    save_df["_source_last_date"] = str(last_price_date)
+    save_df['_source_last_date'] = str(last_price_date)
     save_df.to_parquet(cache_file)
     return result
+
 
 def sanitize_dividend_yield(raw_yield: float | None) -> float:
     if raw_yield is None or np.isnan(raw_yield) or raw_yield <= 0:
@@ -679,29 +651,9 @@ def process_fetch_isin(isin: str) -> dict | None:
             )
 
             X_history = ml_frame.loc[valid_mask, feature_cols].copy()
-            y_reg_history = ml_frame.loc[valid_mask, "future_return"].copy()
+            y_reg_history = ml_frame.loc[valid_mask, 'future_return'].copy()
             y_clf_history = (y_reg_history > TARGET_RETURN_THRESHOLD).astype(int)
-            target_end_dates = pd.to_datetime(
-                ml_frame.loc[valid_mask, "future_end_date"].values, utc=True
-            ).tz_convert(None)
-
-            # Direct return targets for each 1–6 month horizon. We deliberately
-            # align them to the same rows as the 126-day dataset so every horizon
-            # sees exactly the same historical feature observations.
-            horizon_returns = {
-                horizon: ml_frame.loc[valid_mask, f"future_return_{horizon}"].copy()
-                for horizon in FORECAST_HORIZONS
-            }
-            horizon_end_dates = {
-                horizon: pd.Series(
-                    pd.to_datetime(
-                        ml_frame.loc[valid_mask, f"future_end_date_{horizon}"].values,
-                        utc=True,
-                    ).tz_convert(None),
-                    index=X_history.index,
-                )
-                for horizon in FORECAST_HORIZONS
-            }
+            target_end_dates = pd.to_datetime(ml_frame.loc[valid_mask, 'future_end_date'].values, utc=True).tz_convert(None)
             latest_feature = ml_frame[feature_cols].iloc[[-1]].copy()
 
             source_label = "Lokaler Cache" if OFFLINE else "Cache aktualisiert / Daten geladen"
@@ -715,8 +667,6 @@ def process_fetch_isin(isin: str) -> dict | None:
                 "y_clf": y_clf_history,
                 "y_reg": y_reg_history,
                 "target_end_date": pd.Series(target_end_dates, index=X_history.index),
-                "horizon_returns": horizon_returns,
-                "horizon_end_dates": horizon_end_dates,
                 "latest_feature": latest_feature,
             }
         else:
@@ -738,37 +688,16 @@ def _build_training_frame(pooled_records: list[dict]) -> pd.DataFrame:
             continue
         part = r["X_train"].copy()
         part["sample_date"] = pd.to_datetime(part.index, utc=True).tz_convert(None)
+        part["target_end_date"] = pd.to_datetime(r["target_end_date"].values, utc=True).tz_convert(None)
         part["isin"] = r["isin"]
         part["ticker"] = r["ticker"]
         part["target_clf"] = r["y_clf"].values
-
-        # Keep the 126-day aliases used by the existing ranking/validation code.
         part["target_reg"] = r["y_reg"].values
-        part["target_end_date"] = pd.to_datetime(
-            r["target_end_date"].values, utc=True
-        ).tz_convert(None)
-
-        # Additional direct regression targets for the forecast time series.
-        for horizon in FORECAST_HORIZONS:
-            part[f"target_reg_{horizon}"] = r["horizon_returns"][horizon].values
-            part[f"target_end_date_{horizon}"] = pd.to_datetime(
-                r["horizon_end_dates"][horizon].values, utc=True
-            ).tz_convert(None)
-
         rows.append(part.reset_index(drop=True))
     if not rows:
         raise ValueError("Keine gültigen Trainingsdaten für das globale Modell vorhanden.")
     return pd.concat(rows, ignore_index=True).sort_values("sample_date").reset_index(drop=True)
 
-
-def _new_regressor() -> RandomForestRegressor:
-    return RandomForestRegressor(
-        n_estimators=250,
-        max_depth=6,
-        min_samples_leaf=30,
-        random_state=42,
-        n_jobs=RF_N_JOBS,
-    )
 
 def _new_models():
     clf = RandomForestClassifier(
@@ -779,7 +708,71 @@ def _new_models():
         random_state=42,
         n_jobs=RF_N_JOBS,
     )
-    return clf, _new_regressor()
+
+    reg = RandomForestRegressor(
+        n_estimators=250,
+        max_depth=6,
+        min_samples_leaf=30,
+        random_state=42,
+        n_jobs=RF_N_JOBS,
+    )
+
+    return clf, reg
+
+
+def _fit_forest_with_progress(model, X, y, label: str):
+    """Fit a RandomForest in warm-start batches and show tree-level progress.
+
+    Using the same training data and fixed random_state, incremental warm-start
+    fitting produces the same forest as a one-shot fit with the same final
+    n_estimators. The batching is only used to expose progress to the user.
+    """
+    total_trees = int(model.n_estimators)
+    if total_trees <= 0:
+        raise ValueError("RandomForest n_estimators must be positive.")
+
+    if not RF_PROGRESS:
+        model.fit(X, y)
+        return model
+
+    batch_size = min(RF_PROGRESS_BATCH, total_trees)
+    original_warm_start = bool(getattr(model, "warm_start", False))
+    start = time.time()
+    completed = 0
+
+    # Keep the same dataset for every batch. For the classifier this makes the
+    # sklearn warm-start/class_weight warning inapplicable, so suppress only
+    # that warning locally.
+    model.set_params(warm_start=True)
+
+    while completed < total_trees:
+        completed = min(completed + batch_size, total_trees)
+        model.set_params(n_estimators=completed)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r'class_weight presets "balanced" or "balanced_subsample" are not recommended for warm_start.*',
+                category=UserWarning,
+            )
+            model.fit(X, y)
+
+        elapsed = max(time.time() - start, 1e-9)
+        rate = completed / elapsed
+        remaining = total_trees - completed
+        eta = remaining / rate if rate > 0 else 0.0
+        fraction = completed / total_trees
+        filled = min(RF_PROGRESS_WIDTH, int(round(RF_PROGRESS_WIDTH * fraction)))
+        bar = "█" * filled + "░" * (RF_PROGRESS_WIDTH - filled)
+        print(
+            f"\r  {label:<28} [{bar}] {completed:>3}/{total_trees} "
+            f"({fraction*100:5.1f}%) | {format_duration(elapsed)} | ETA {format_duration(eta)}",
+            end="",
+            flush=True,
+        )
+
+    print()
+    model.set_params(n_estimators=total_trees, warm_start=original_warm_start)
+    return model
 
 
 def walk_forward_validate(dataset: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
@@ -809,8 +802,15 @@ def walk_forward_validate(dataset: pd.DataFrame, feature_cols: list[str]) -> pd.
             continue
 
         clf, reg = _new_models()
-        clf.fit(train[feature_cols], train["target_clf"])
-        reg.fit(train[feature_cols], train["target_reg"])
+        fold_total = len(possible_starts)
+        _fit_forest_with_progress(
+            clf, train[feature_cols], train["target_clf"],
+            f"Fold {fold_no}/{fold_total} classifier",
+        )
+        _fit_forest_with_progress(
+            reg, train[feature_cols], train["target_reg"],
+            f"Fold {fold_no}/{fold_total} regressor",
+        )
         prob = clf.predict_proba(test[feature_cols])[:, 1]
         pred_ret = reg.predict(test[feature_cols])
 
@@ -852,31 +852,56 @@ def walk_forward_validate(dataset: pd.DataFrame, feature_cols: list[str]) -> pd.
     return result_df
 
 
-def train_global_ai_models(
-    pooled_records: list[dict],
-) -> tuple[CalibratedRFClassifier, dict[int, RandomForestRegressor], pd.DataFrame]:
-    """Legacy convenience wrapper: validate, then train all production horizons."""
+def train_global_ai_models(pooled_records: list[dict]) -> tuple[CalibratedRFClassifier, RandomForestRegressor, pd.DataFrame]:
+    """Validiert chronologisch und trainiert anschließend Produktionsmodelle mit zeitgerechter Kalibrierung."""
     print(f"\nSammle Trainingsdaten von {len(pooled_records)} Wertpapieren...")
     dataset = _build_training_frame(pooled_records)
-    feature_cols = [
-        c for c in extract_features(pooled_records[0]["history"]).columns if c in dataset.columns
-    ]
+    feature_cols = [c for c in extract_features(pooled_records[0]["history"]).columns if c in dataset.columns]
 
     with sqlite3.connect(DATABASE_PATH) as conn:
         db_dataset = dataset.copy()
         db_dataset["sample_date"] = db_dataset["sample_date"].astype(str)
-        for col in [c for c in db_dataset.columns if c.startswith("target_end_date")]:
-            db_dataset[col] = db_dataset[col].astype(str)
+        db_dataset["target_end_date"] = db_dataset["target_end_date"].astype(str)
         db_dataset.to_sql("training_data", conn, if_exists="replace", index=False)
-    print(
-        f"✓ {len(dataset):,} Trainingszeilen in Tabelle 'training_data' "
-        f"in '{DATABASE_PATH}' gespeichert."
-    )
+    print(f"✓ {len(dataset):,} Trainingszeilen in Tabelle 'training_data' in '{DATABASE_PATH}' gespeichert.")
 
     validation = walk_forward_validate(dataset, feature_cols)
-    classifier, horizon_regressors = train_production_models_from_dataset(dataset, feature_cols)
-    print("✓ Globale Produktionsmodelle trainiert.\n")
-    return classifier, horizon_regressors, validation
+
+    # Time-aware calibration: reserve the most recent ~126 feature dates for calibration,
+    # while purging any fitting labels that extend into that calibration period.
+    unique_dates = np.array(sorted(pd.to_datetime(dataset["sample_date"].unique())))
+    calibrator = None
+    base_clf, reg = _new_models()
+
+    if len(unique_dates) > MIN_TRAIN_DATES + WALK_FORWARD_TEST_DAYS:
+        calib_start = pd.Timestamp(unique_dates[-WALK_FORWARD_TEST_DAYS])
+        fit = dataset[dataset["target_end_date"] < calib_start]
+        calib = dataset[dataset["sample_date"] >= calib_start]
+        if len(fit) >= 1000 and len(calib) >= 100 and fit["target_clf"].nunique() == 2 and calib["target_clf"].nunique() == 2:
+            _fit_forest_with_progress(
+                base_clf, fit[feature_cols], fit["target_clf"], "Production classifier"
+            )
+            raw_prob = base_clf.predict_proba(calib[feature_cols])[:, 1]
+
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(raw_prob, calib["target_clf"].to_numpy())
+            print(f"✓ Wahrscheinlichkeitskalibrierung auf {len(calib):,} jüngsten, zeitlich getrennten Zeilen angepasst.")
+        else:
+            _fit_forest_with_progress(
+                base_clf, dataset[feature_cols], dataset["target_clf"], "Production classifier"
+            )
+    else:
+        _fit_forest_with_progress(
+            base_clf, dataset[feature_cols], dataset["target_clf"], "Production classifier"
+        )
+
+    # Regression is trained on all labelled history after validation; current inference is beyond all labels.
+    _fit_forest_with_progress(
+        reg, dataset[feature_cols], dataset["target_reg"], "Production regressor"
+    )
+    print("✓ Globales Produktionsmodell trainiert.\n")
+    return CalibratedRFClassifier(base_clf, calibrator), reg, validation
+
 
 def plot_single_prediction(
     isin: str,
@@ -885,54 +910,30 @@ def plot_single_prediction(
     forecast_series: pd.Series | None,
     ai_prob: float,
     expected_ret: float,
-    forecast_horizons: list[int] | None = None,
     output_dir: str = PLOTS_DIR,
 ) -> None:
-    """Plot history plus direct model forecasts at 1M–6M horizons."""
-    if forecast_series is None or forecast_series.empty or df_history.empty:
+    """Plot history plus a dashed endpoint scenario, not a claimed daily price forecast."""
+    if forecast_series is None or df_history.empty:
         return
 
     os.makedirs(output_dir, exist_ok=True)
     fig, ax = plt.subplots(figsize=(10, 5))
 
     history_slice = df_history["Close"].iloc[-380:]
-    current_date = history_slice.index[-1]
-    current_price = float(history_slice.iloc[-1])
     ax.plot(history_slice.index, history_slice.values, label="Historischer Kurs", lw=2)
 
-    # Connect the actual current price to the six independently predicted horizon
-    # prices. The connecting line is only a visual guide; the markers are the
-    # direct model outputs.
-    forecast_plot = pd.concat([
-        pd.Series([current_price], index=[current_date]),
-        forecast_series,
-    ])
     ax.plot(
-        forecast_plot.index,
-        forecast_plot.values,
+        [history_slice.index[-1], forecast_series.index[-1]],
+        [history_slice.values[-1], forecast_series.values[-1]],
         linestyle="--",
-        marker="o",
         lw=2,
-        label="Direkte 1–6M-Prognosen",
+        label=f"6M-Endpunktszenario ({expected_ret*100:+.1f}%)",
     )
-    ax.axvline(x=current_date, linestyle=":", label="Prognosebeginn")
-
-    horizons_for_plot = forecast_horizons or list(FORECAST_HORIZONS[: len(forecast_series)])
-    for horizon, (date, price) in zip(horizons_for_plot, forecast_series.items()):
-        ax.annotate(
-            FORECAST_LABELS[horizon],
-            xy=(date, price),
-            xytext=(0, 7),
-            textcoords="offset points",
-            ha="center",
-            fontsize=8,
-        )
-
+    ax.scatter([forecast_series.index[-1]], [forecast_series.values[-1]], s=45, zorder=4)
+    ax.axvline(x=history_slice.index[-1], linestyle=":", label="Prognosebeginn")
     ax.set_title(
-        f"{ticker} ({isin}) — direkte 1–6M-Kursprognose | "
-        f"6M E[R]={expected_ret*100:+.1f}% | "
-        f"P(6M Return > {TARGET_RETURN_THRESHOLD*100:.0f}%)={ai_prob*100:.1f}%",
-        fontsize=11,
+        f"{ticker} ({isin}) — 6M-Endpunkt | P(Return > {TARGET_RETURN_THRESHOLD*100:.0f}%)={ai_prob*100:.1f}%",
+        fontsize=12,
         fontweight="bold",
     )
     ax.set_xlabel("Datum")
@@ -945,6 +946,7 @@ def plot_single_prediction(
     filename = os.path.join(output_dir, f"{ticker}_{isin}.png")
     fig.savefig(filename, dpi=180)
     plt.close(fig)
+
 
 def rank_portfolio(records: list[dict], max_per_sector: int = 2) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.DataFrame(records)
@@ -1037,39 +1039,19 @@ def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_pre
         expected = item["metrics"]["Expected_Return_%"]
 
         ax.plot(hist.index, hist.values, label="Historie")
-        if f_series is not None and not f_series.empty:
-            current_date = hist.index[-1]
-            current_price = float(hist.iloc[-1])
-            forecast_plot = pd.concat([
-                pd.Series([current_price], index=[current_date]),
-                f_series,
-            ])
+        if f_series is not None:
             ax.plot(
-                forecast_plot.index,
-                forecast_plot.values,
+                [hist.index[-1], f_series.index[-1]],
+                [hist.values[-1], f_series.values[-1]],
                 linestyle="--",
-                marker="o",
-                markersize=4,
-                label="1–6M Prognose",
+                label="6M-Endpunkt",
             )
-            ax.axvline(x=current_date, linestyle=":")
-
-            horizons_for_plot = sorted(item.get("forecast_returns", {}).keys())
-            if not horizons_for_plot:
-                horizons_for_plot = list(FORECAST_HORIZONS[: len(f_series)])
-            for horizon, (date, price) in zip(horizons_for_plot, f_series.items()):
-                ax.annotate(
-                    FORECAST_LABELS[horizon],
-                    xy=(date, price),
-                    xytext=(0, 5),
-                    textcoords="offset points",
-                    ha="center",
-                    fontsize=6.5,
-                )
+            ax.scatter([f_series.index[-1]], [f_series.values[-1]], s=30)
+            ax.axvline(x=hist.index[-1], linestyle=":")
 
         ax.set_title(
             f"#{idx+1}: {ticker} | Score {item['metrics']['Score']} | "
-            f"P>{TARGET_RETURN_THRESHOLD*100:.0f}% {prob*100:.0f}% | 6M E[R] {expected:+.1f}%\n"
+            f"P>{TARGET_RETURN_THRESHOLD*100:.0f}% {prob*100:.0f}% | E[R] {expected:+.1f}%\n"
             f"ISIN: {isin}",
             fontsize=9,
             fontweight="bold",
@@ -1082,12 +1064,7 @@ def plot_top_predictions_grid(top_picks: list[dict], output_file: str = "top_pre
     for idx in range(n_plots, len(axes)):
         axes[idx].axis("off")
 
-    plt.suptitle(
-        "Top-Kandidaten: direkte 1–6-Monats-Kursprognosen",
-        fontsize=14,
-        fontweight="bold",
-        y=0.98,
-    )
+    plt.suptitle("Top-Kandidaten: 6-Monats-Endpunktszenarien", fontsize=14, fontweight="bold", y=0.98)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output_file, dpi=200)
     plt.close()
@@ -1164,8 +1141,7 @@ def prepare_training_dataset(
         with sqlite3.connect(DATABASE_PATH) as conn:
             db_dataset = dataset.copy()
             db_dataset["sample_date"] = db_dataset["sample_date"].astype(str)
-            for col in [c for c in db_dataset.columns if c.startswith("target_end_date")]:
-                db_dataset[col] = db_dataset[col].astype(str)
+            db_dataset["target_end_date"] = db_dataset["target_end_date"].astype(str)
             db_dataset.to_sql("training_data", conn, if_exists="replace", index=False)
         print(f"✓ {len(dataset):,} Trainingszeilen in '{DATABASE_PATH}' gespeichert.")
 
@@ -1186,13 +1162,12 @@ def analyze_records(pooled_records: list[dict]) -> pd.DataFrame:
 def train_production_models_from_dataset(
     dataset: pd.DataFrame,
     feature_cols: list[str],
-) -> tuple[CalibratedRFClassifier, dict[int, RandomForestRegressor]]:
-    """Train the 6M classifier plus direct regressors for all forecast horizons."""
+) -> tuple[CalibratedRFClassifier, RandomForestRegressor]:
+    """Train production models without running walk-forward validation again."""
     unique_dates = np.array(sorted(pd.to_datetime(dataset["sample_date"].unique())))
     calibrator = None
-    base_clf, _ = _new_models()
+    base_clf, reg = _new_models()
 
-    # The probability classifier remains the existing 126-day >10% target.
     if len(unique_dates) > MIN_TRAIN_DATES + WALK_FORWARD_TEST_DAYS:
         calib_start = pd.Timestamp(unique_dates[-WALK_FORWARD_TEST_DAYS])
         fit = dataset[dataset["target_end_date"] < calib_start]
@@ -1203,7 +1178,9 @@ def train_production_models_from_dataset(
             and fit["target_clf"].nunique() == 2
             and calib["target_clf"].nunique() == 2
         ):
-            base_clf.fit(fit[feature_cols], fit["target_clf"])
+            _fit_forest_with_progress(
+                base_clf, fit[feature_cols], fit["target_clf"], "Production classifier"
+            )
             raw_prob = base_clf.predict_proba(calib[feature_cols])[:, 1]
             calibrator = IsotonicRegression(out_of_bounds="clip")
             calibrator.fit(raw_prob, calib["target_clf"].to_numpy())
@@ -1212,68 +1189,38 @@ def train_production_models_from_dataset(
                 "jüngsten, zeitlich getrennten Zeilen angepasst."
             )
         else:
-            base_clf.fit(dataset[feature_cols], dataset["target_clf"])
-    else:
-        base_clf.fit(dataset[feature_cols], dataset["target_clf"])
-
-    # One direct model per horizon. These are not recursive forecasts: every model
-    # learns the realized return from the observation date directly to its horizon.
-    horizon_regressors: dict[int, RandomForestRegressor] = {}
-    print("Trainiere direkte Rendite-Prognosen für 1–6 Monate:")
-    for horizon in FORECAST_HORIZONS:
-        target_col = f"target_reg_{horizon}"
-        if target_col not in dataset.columns:
-            # Compatibility fallback for a legacy in-memory dataset.
-            if horizon == FORWARD_DAYS and "target_reg" in dataset.columns:
-                target_col = "target_reg"
-            else:
-                raise ValueError(
-                    f"Trainingsziel '{target_col}' fehlt. Feature-Cache muss neu aufgebaut werden."
-                )
-
-        valid = dataset[target_col].notna() & np.isfinite(dataset[target_col])
-        train_part = dataset.loc[valid]
-        if len(train_part) < 1000:
-            raise ValueError(
-                f"Zu wenige Trainingszeilen für {FORECAST_LABELS[horizon]} "
-                f"({len(train_part):,})."
+            _fit_forest_with_progress(
+                base_clf, dataset[feature_cols], dataset["target_clf"], "Production classifier"
             )
-
-        reg = _new_regressor()
-        reg.fit(train_part[feature_cols], train_part[target_col])
-        horizon_regressors[horizon] = reg
-        print(
-            f"  ✓ {FORECAST_LABELS[horizon]} ({horizon} Handelstage): "
-            f"{len(train_part):,} Trainingszeilen"
+    else:
+        _fit_forest_with_progress(
+            base_clf, dataset[feature_cols], dataset["target_clf"], "Production classifier"
         )
 
+    _fit_forest_with_progress(
+        reg, dataset[feature_cols], dataset["target_reg"], "Production regressor"
+    )
+
     print("✓ Produktionsmodelle trainiert.")
-    return CalibratedRFClassifier(base_clf, calibrator), horizon_regressors
+    return CalibratedRFClassifier(base_clf, calibrator), reg
 
 
 def save_production_models(
     classifier: CalibratedRFClassifier,
-    horizon_regressors: dict[int, RandomForestRegressor],
+    regressor: RandomForestRegressor,
     feature_cols: list[str],
     path: Path = MODEL_BUNDLE_FILE,
 ) -> None:
-    """Persist classifier and all direct horizon regressors for ranking-only runs."""
+    """Persist the trained model bundle for later ranking-only runs."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if FORWARD_DAYS not in horizon_regressors:
-        raise ValueError(f"{FORWARD_DAYS}-Tage-Regressor fehlt im Modellbundle.")
-
     payload = {
         "classifier": classifier,
-        "horizon_regressors": dict(horizon_regressors),
-        # Legacy alias for older tooling that expects a single 126-day regressor.
-        "regressor": horizon_regressors[FORWARD_DAYS],
+        "regressor": regressor,
         "feature_cols": feature_cols,
         "trained_at": pd.Timestamp.now("UTC").isoformat(),
         "rf_n_jobs": RF_N_JOBS,
         "forward_days": FORWARD_DAYS,
-        "forecast_horizons": list(FORECAST_HORIZONS),
         "target_return_threshold": TARGET_RETURN_THRESHOLD,
-        "model_version": 2,
     }
     dump(payload, path)
     print(f"✓ Produktionsmodell gespeichert: '{path}'")
@@ -1281,81 +1228,36 @@ def save_production_models(
 
 def load_production_models(
     path: Path = MODEL_BUNDLE_FILE,
-) -> tuple[CalibratedRFClassifier, dict[int, RandomForestRegressor], list[str], dict]:
-    """Load the saved production model bundle, with legacy 6M compatibility."""
+) -> tuple[CalibratedRFClassifier, RandomForestRegressor, list[str], dict]:
+    """Load the saved production model bundle."""
     if not path.exists():
         raise FileNotFoundError(
             f"Kein gespeichertes Produktionsmodell gefunden: {path}. "
             "Bitte zuerst 'python train.py' ausführen."
         )
     payload = load(path)
-
-    raw_horizon_models = payload.get("horizon_regressors")
-    if raw_horizon_models:
-        horizon_regressors = {int(k): v for k, v in raw_horizon_models.items()}
-    elif "regressor" in payload:
-        horizon_regressors = {FORWARD_DAYS: payload["regressor"]}
-        print(
-            "⚠ Altes Modellbundle erkannt: nur 6M-Endpunkt verfügbar. "
-            "Für die 1–6M-Zeitreihe bitte einmal 'python train.py' ausführen."
-        )
-    else:
-        raise ValueError("Modellbundle enthält keinen Regressor.")
-
-    return payload["classifier"], horizon_regressors, list(payload["feature_cols"]), payload
+    return payload["classifier"], payload["regressor"], list(payload["feature_cols"]), payload
 
 
-def train_and_save_records(
-    pooled_records: list[dict],
-) -> tuple[CalibratedRFClassifier, dict[int, RandomForestRegressor], list[str]]:
-    """Train all production models from cached records and persist them."""
+def train_and_save_records(pooled_records: list[dict]) -> tuple[CalibratedRFClassifier, RandomForestRegressor, list[str]]:
+    """Train production models from cached records and persist them."""
     dataset, feature_cols = prepare_training_dataset(pooled_records, save_training_data=True)
-    classifier, horizon_regressors = train_production_models_from_dataset(dataset, feature_cols)
-    save_production_models(classifier, horizon_regressors, feature_cols)
-    return classifier, horizon_regressors, feature_cols
-
-
-def _forecast_date(last_date: pd.Timestamp, horizon: int) -> pd.Timestamp:
-    """Approximate a trading horizon with business days for display purposes."""
-    return pd.bdate_range(start=pd.Timestamp(last_date), periods=horizon + 1)[-1]
-
-
-def build_direct_forecast_series(
-    current_price: float,
-    last_date: pd.Timestamp,
-    predicted_returns: dict[int, float],
-) -> pd.Series | None:
-    """Convert direct horizon return predictions to a dated price series."""
-    dates = []
-    prices = []
-    for horizon in FORECAST_HORIZONS:
-        if horizon not in predicted_returns:
-            continue
-        pred_ret = float(predicted_returns[horizon])
-        if not np.isfinite(pred_ret):
-            continue
-        dates.append(_forecast_date(last_date, horizon))
-        # A price cannot be negative. Keep the model return itself untouched for
-        # ranking/reporting but bound the plotted price at a tiny positive value.
-        prices.append(max(0.01, float(current_price) * (1.0 + pred_ret)))
-
-    if not dates:
-        return None
-    return pd.Series(prices, index=pd.DatetimeIndex(dates), dtype=float)
+    classifier, regressor = train_production_models_from_dataset(dataset, feature_cols)
+    save_production_models(classifier, regressor, feature_cols)
+    return classifier, regressor, feature_cols
 
 
 def generate_ranking(
     fetched_records: list[dict],
     classifier: CalibratedRFClassifier,
-    horizon_regressors: dict[int, RandomForestRegressor],
+    regressor: RandomForestRegressor,
     feature_cols: list[str],
     create_plots: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Generate today's ranking plus direct 1–6M forecast time series."""
+    """Generate today's ranking from cached records and an already-trained model."""
     initialize_database()
     collected_metrics: list[dict] = []
     bundle_store: dict[str, dict] = {}
-    forecast_rows: list[dict] = []
 
     print("Erzeuge Ranking mit gespeichertem Produktionsmodell...")
     for item in fetched_records:
@@ -1365,47 +1267,23 @@ def generate_ranking(
         df_history = item["history"]
         latest_feat = item["latest_feature"].reindex(columns=feature_cols)
 
-        predicted_returns: dict[int, float] = {}
         if latest_feat.empty or latest_feat.isna().any(axis=1).iloc[0]:
             prob = 0.5
             pred_ret = 0.0
             forecast_series = None
         else:
             prob = float(classifier.predict_proba(latest_feat)[0][1])
-            for horizon, model in sorted(horizon_regressors.items()):
-                if horizon in FORECAST_HORIZONS:
-                    predicted_returns[horizon] = float(model.predict(latest_feat)[0])
+            pred_ret = float(regressor.predict(latest_feat)[0])
 
-            pred_ret = float(predicted_returns.get(FORWARD_DAYS, 0.0))
-            forecast_series = build_direct_forecast_series(
-                current_price=metrics["Price"],
-                last_date=df_history.index[-1],
-                predicted_returns=predicted_returns,
-            )
+            current_price = metrics["Price"]
+            last_date = df_history.index[-1]
+            endpoint_date = pd.bdate_range(start=last_date, periods=FORWARD_DAYS + 1)[-1]
+            target_price = current_price * (1.0 + pred_ret)
+            forecast_series = pd.Series([target_price], index=[endpoint_date])
 
         metrics["AI_Prob"] = round(prob, 3)
         metrics["Expected_Return_%"] = round(pred_ret * 100, 2)
-        for horizon, pred in predicted_returns.items():
-            metrics[f"Expected_Return_{FORECAST_LABELS[horizon]}_%"] = round(pred * 100, 2)
         collected_metrics.append(metrics)
-
-        if forecast_series is not None:
-            current_price = float(metrics["Price"])
-            for horizon in FORECAST_HORIZONS:
-                if horizon not in predicted_returns:
-                    continue
-                date = _forecast_date(df_history.index[-1], horizon)
-                pred = predicted_returns[horizon]
-                forecast_rows.append({
-                    "ISIN": isin,
-                    "Ticker": ticker,
-                    "Horizon": FORECAST_LABELS[horizon],
-                    "Horizon_Days": horizon,
-                    "Forecast_Date": date.date().isoformat(),
-                    "Current_Price": current_price,
-                    "Predicted_Return_%": round(pred * 100, 4),
-                    "Predicted_Price": round(max(0.01, current_price * (1.0 + pred)), 4),
-                })
 
         save_instrument(
             isin=isin,
@@ -1424,23 +1302,17 @@ def generate_ranking(
                 forecast_series=forecast_series,
                 ai_prob=prob,
                 expected_ret=pred_ret,
-                forecast_horizons=sorted(predicted_returns),
             )
 
         bundle_store[isin] = {
             "metrics": metrics,
             "history": df_history,
             "forecast": forecast_series,
-            "forecast_returns": predicted_returns,
             "ret": pred_ret,
         }
 
     full_ranking, diversified = rank_portfolio(collected_metrics, max_per_sector=2)
     save_scores(full_ranking)
-
-    if forecast_rows:
-        pd.DataFrame(forecast_rows).to_csv("forecast_timeseries.csv", index=False)
-        print("✓ Direkte 1–6M-Prognosen in 'forecast_timeseries.csv' gespeichert.")
 
     print("\n" + "=" * 115)
     print("FINALE INVESTMENT-RANGLISTE")
@@ -1459,6 +1331,7 @@ def generate_ranking(
 
     print(f"Datenbank und Scores aktualisiert in '{DATABASE_PATH}'.")
     return full_ranking, diversified
+
 
 def print_cache_summary() -> None:
     cached_isins = get_cached_isin_list()
